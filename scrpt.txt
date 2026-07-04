@@ -1,3 +1,409 @@
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1015
+CHECK_NAME  = "Contact number validation from technician record"
+NEW_TABLE   = "p_table_1015"
+
+# Customer contact fields to validate
+CUSTOMER_PHONE_COLS = [
+    "calling_from_number",
+    "customer_contact",
+    "customer_registered_phone",
+    "customer_alternate_phone",
+]
+
+# Path to technician master Excel file
+TECH_MASTER_EXCEL = r"technician_master.xlsx"   # <-- update this path if needed
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+# base_df = pd.read_sql(
+#     "SELECT * FROM p_base_data "
+#     "WHERE sr_open_date >= '2025-01-16' "
+#     "AND sr_open_date < '2025-01-19' "
+#     "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+#     conn
+# )
+
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data ", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+
+# ---- Build technician phone master set from p_base_data ----
+tech_phones_df = pd.read_sql(
+    "SELECT DISTINCT tech_id, tech_name, tech_phone "
+    "FROM p_base_data "
+    "WHERE tech_phone IS NOT NULL AND tech_phone != ''",
+    conn
+)
+print(f"Distinct technician phone records from p_base_data: {len(tech_phones_df)}")
+
+# ---- Also load technician master Excel (specific columns only) ----
+try:
+    tech_master_df = pd.read_excel(
+        TECH_MASTER_EXCEL,
+        usecols=["Tech Id", "First Name", "Last Name", "Cell Phone #"]
+    )
+
+    # Combine first + last name into one name field
+    tech_master_df["tech_name"] = (
+        tech_master_df["First Name"].fillna("").astype(str).str.strip() + " " +
+        tech_master_df["Last Name"].fillna("").astype(str).str.strip()
+    ).str.strip()
+
+    # Rename to match p_base_data schema
+    tech_master_df = tech_master_df.rename(columns={
+        "Tech Id":      "tech_id",
+        "Cell Phone #": "tech_phone",
+    })
+
+    tech_master_df = tech_master_df[["tech_id", "tech_name", "tech_phone"]]
+    print(f"Technician master (Excel) rows: {len(tech_master_df)}")
+except Exception as e:
+    print(f"[WARN] Could not read technician master Excel: {e}")
+    tech_master_df = pd.DataFrame(columns=["tech_id", "tech_name", "tech_phone"])
+
+# ---- Combine both sources ----
+combined_tech_df = pd.concat([tech_phones_df, tech_master_df], ignore_index=True)
+combined_tech_df = combined_tech_df.dropna(subset=["tech_phone"])
+combined_tech_df = combined_tech_df[combined_tech_df["tech_phone"].astype(str).str.strip() != ""]
+combined_tech_df = combined_tech_df.drop_duplicates(subset=["tech_id", "tech_phone"])
+print(f"Total combined technician records: {len(combined_tech_df)}")
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "error", "na", "n/a"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+
+def split_multi(v, sep=r"[\^,;/|]"):
+    """Split a value on common multi-value separators."""
+    if is_missing(v):
+        return []
+    return [x.strip() for x in re.split(sep, str(v)) if x.strip()]
+
+
+def clean_phone_set(v):
+    """
+    Normal cleaning of phone numbers:
+      - split on ^ , ; / |
+      - remove ALL non-digit characters (spaces, +, -, (), etc.)
+      - keep only last 10 digits
+      - drop entries that don't have at least 10 digits
+    Returns a set of cleaned 10-digit phone numbers.
+    """
+    nums = set()
+    for part in split_multi(v):
+        digits = re.sub(r"\D", "", part)   # keep digits only
+        if len(digits) >= 10:
+            nums.add(digits[-10:])
+    return nums
+
+# =========================================================
+# BUILD TECHNICIAN PHONE LOOKUP (exact only)
+# =========================================================
+# Map: cleaned 10-digit phone -> list of (tech_id, tech_name)
+tech_phone_lookup = {}
+for _, row in combined_tech_df.iterrows():
+    for p in clean_phone_set(row.get("tech_phone")):
+        tech_phone_lookup.setdefault(p, []).append(
+            (row.get("tech_id"), row.get("tech_name"))
+        )
+
+tech_phone_set = set(tech_phone_lookup.keys())
+print(f"Total distinct technician phones (cleaned): {len(tech_phone_set)}")
+
+# =========================================================
+# CHECK FUNCTION (EXACT MATCH ONLY)
+# =========================================================
+def check_customer_phones_vs_tech(customer_vals):
+    """
+    customer_vals: dict {col_name: value}
+    Returns:
+      flag (0/1)         -> 1 if ANY cleaned customer phone exactly matches ANY cleaned tech phone
+      observed_values    -> "9876543210 (from customer_contact)"
+      matched_tech_info  -> "Tech ID: T123 | Name: Ramesh | Phone: 9876543210"
+      matched_cust_cols  -> "customer_contact"
+    """
+    hits = []  # (cust_phone, cust_col, tech_id, tech_name)
+
+    for col_name, val in customer_vals.items():
+        cust_phones = clean_phone_set(val)
+        if not cust_phones:
+            continue
+
+        # Exact intersection only
+        exact_matches = cust_phones & tech_phone_set
+        for p in exact_matches:
+            for tid, tname in tech_phone_lookup.get(p, []):
+                hits.append((p, col_name, tid, tname))
+
+    if not hits:
+        return 0, "", "", ""
+
+    # Deduplicate hits
+    seen = set()
+    uniq = []
+    for h in hits:
+        key = (h[0], h[1], h[2])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(h)
+
+    observed_values   = "; ".join([f"{h[0]} (from {h[1]})" for h in uniq])
+    matched_tech_info = "; ".join([f"Tech ID: {h[2]} | Name: {h[3]} | Phone: {h[0]}" for h in uniq])
+    matched_cust_cols = ", ".join(sorted({h[1] for h in uniq}))
+
+    return 1, observed_values, matched_tech_info, matched_cust_cols
+
+# =========================================================
+# APPLY CHECK
+# =========================================================
+def row_check(r):
+    customer_vals = {c: r.get(c) for c in CUSTOMER_PHONE_COLS}
+    flag, observed_values, matched_tech_info, matched_cust_cols = \
+        check_customer_phones_vs_tech(customer_vals)
+
+    return pd.Series({
+        "tech_phone_match":  flag,
+        "observed_values":   observed_values,
+        "matched_tech_info": matched_tech_info,
+        "matched_cust_cols": matched_cust_cols,
+    })
+
+check_results = base_df.apply(row_check, axis=1)
+base_df["tech_phone_match"]  = check_results["tech_phone_match"].astype(int)
+base_df["observed_values"]   = check_results["observed_values"]
+base_df["matched_tech_info"] = check_results["matched_tech_info"]
+base_df["matched_cust_cols"] = check_results["matched_cust_cols"]
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+def build_exception_flag(flag):
+    # Customer phone matching technician phone is SUSPICIOUS -> exception = yes
+    return "yes" if flag == 1 else "no"
+
+
+def build_expected_value():
+    return "N/A"
+
+
+def build_observed_value(flag, observed_values, matched_cust_cols):
+    if flag == 1:
+        return (f"Customer phone(s) {observed_values} matched with technician "
+                f"records (fields involved: {matched_cust_cols})")
+    return "No customer contact number matched with any technician record"
+
+
+def build_additional_remarks(flag, matched_tech_info):
+    if flag == 1:
+        return (f"Potential conflict - customer contact appears in technician "
+                f"database. Matched technician details: {matched_tech_info}")
+    return "Clean - no overlap between customer contacts and technician phones"
+
+
+output_df = pd.DataFrame({
+    "check_id":                  CHECK_ID,
+    "check_name":                CHECK_NAME,
+    "created_at":                now_ts,
+    "updated_at":                now_ts,
+    "is_active":                 base_df.get("is_active"),
+    "header_crm_id":             base_df["header_crm_id"],
+    "sr_number":                 base_df.get("sr_number"),
+    "attch_id":                  base_df.get("attch_id"),
+    "category":                  base_df.get("category"),
+    "calling_from_number":       base_df.get("calling_from_number"),
+    "customer_contact":          base_df.get("customer_contact"),
+    "customer_registered_phone": base_df.get("customer_registered_phone"),
+    "customer_alternate_phone":  base_df.get("customer_alternate_phone"),
+    "tech_phone_match":          base_df["tech_phone_match"],
+    "observed_values":           base_df["observed_values"],
+    "matched_tech_info":         base_df["matched_tech_info"],
+    "matched_cust_cols":         base_df["matched_cust_cols"],
+    "exception_flag":            base_df["tech_phone_match"].apply(build_exception_flag),
+    "expected_value":            build_expected_value(),
+    "reason": base_df.apply(
+        lambda r: build_observed_value(
+            r["tech_phone_match"],
+            r["observed_values"],
+            r["matched_cust_cols"]
+        ),
+        axis=1
+    ),
+    "additional_remarks": base_df.apply(
+        lambda r: build_additional_remarks(
+            r["tech_phone_match"],
+            r["matched_tech_info"]
+        ),
+        axis=1
+    ),
+})
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+test = output_df[output_df['exception_flag'] == 'yes']
+
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+print(f"Exception=yes (tech phone overlap): {(output_df['exception_flag']=='yes').sum()}")
+print(f"Exception=no  (clean):              {(output_df['exception_flag']=='no').sum()}")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id VARCHAR(255),
+#   category VARCHAR(255),
+#   calling_from_number TEXT,
+#   customer_contact TEXT,
+#   customer_registered_phone TEXT,
+#   customer_alternate_phone TEXT,
+#   tech_phone_match TINYINT,
+#   matched_phones TEXT,
+#   matched_tech_info TEXT,
+#   matched_cust_cols VARCHAR(255),
+#   exception_flag VARCHAR(10),
+#   expected_value TEXT,
+#   observed_value TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id)
+# )
+# """
+
+# cursor.execute(create_sql)
+# conn.commit()
+
+insert_cols = [
+    "check_id","check_name","created_at","updated_at","is_active",
+    "header_crm_id","sr_number","attch_id","category",
+    "calling_from_number","customer_contact",
+    "customer_registered_phone","customer_alternate_phone",
+    "tech_phone_match","observed_values","matched_tech_info","matched_cust_cols",
+    "exception_flag","expected_value","reason","additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols if c not in ["check_id","header_crm_id","sr_number","attch_id","created_at"]]
+update_sql = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i+BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i+len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1015")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################################
+
+
+
+
+
+
 
 import os
 import re
