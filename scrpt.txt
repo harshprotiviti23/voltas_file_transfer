@@ -1,6 +1,467 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# Inimport os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1002
+CHECK_NAME  = "Dealer name and GST match with customer invoice"
+NEW_TABLE   = "p_table_1002"
+
+# =========================================================
+# THRESHOLDS
+# =========================================================
+THRESHOLDS = {
+    "dealer_name": {"ratio": 0.80, "max_edits": 3},
+    "gstin":       {"ratio": 0.85, "max_edits": 2},
+}
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data "
+    "WHERE sr_open_date >= '2025-01-16' "
+    "AND sr_open_date < '2025-01-19' "
+    "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+    conn
+)
+unst_df = pd.read_sql("SELECT * FROM p_unst_str_customer_invoice", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+print(f"unst_str_customer_invoice rows: {len(unst_df)}")
+
+# =========================================================
+# RENAME COLUMNS
+# =========================================================
+JOIN_KEYS = ["header_crm_id", "sr_id", "attch_id"]
+
+unst_df = unst_df.rename(
+    columns={c: f"{c}_unst_str" for c in unst_df.columns if c not in JOIN_KEYS}
+)
+
+# =========================================================
+# MERGE
+# =========================================================
+merged_df = pd.merge(base_df, unst_df.drop_duplicates(subset=JOIN_KEYS), on=JOIN_KEYS, how="left")
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print(f"Merged rows: {len(merged_df)}")
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "error", "na", "n/a"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+
+def norm_alnum_upper(v):
+    if is_missing(v):
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(v).upper())
+
+
+def norm_text(v):
+    if is_missing(v):
+        return ""
+    s = str(v).lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+BUSINESS_SUFFIXES = {
+    "pvt", "private", "ltd", "limited", "llp", "inc", "co", "company",
+    "corp", "corporation", "enterprises", "enterprise", "trader", "traders",
+    "trading", "agency", "agencies", "sales", "services", "service",
+    "and", "the", "of"
+}
+
+def norm_dealer_name(v):
+    s = norm_text(v)
+    if not s:
+        return ""
+    tokens = [t for t in s.split() if t not in BUSINESS_SUFFIXES]
+    return " ".join(tokens)
+
+
+def seq_ratio(a, b):
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def edit_distance(a, b):
+    if not a or not b:
+        return max(len(a or ""), len(b or ""))
+    return Levenshtein.distance(a, b)
+
+
+def fuzzy_match(a, b, ratio_threshold, max_edits):
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if seq_ratio(a, b) >= ratio_threshold:
+        return True
+    if edit_distance(a, b) <= max_edits:
+        return True
+    return False
+
+
+# def check_dealer_name(a, b, t=THRESHOLDS["dealer_name"]):
+#     a, b = norm_dealer_name(a), norm_dealer_name(b)
+#     if not a or not b:
+#         return 0
+#     score = fuzz.token_set_ratio(a, b)            # 0-100
+#     if score >= t["ratio"] * 100:
+#         return 1
+#     return int(edit_distance(a, b) <= t["max_edits"])
+
+
+# def check_gstin(a, b, t=THRESHOLDS["gstin"]):
+#     a, b = norm_alnum_upper(a), norm_alnum_upper(b)
+#     if not a or not b:
+#         return 0
+#     if a == b:
+#         return 1
+#     if len(a) < 12 or len(b) < 12:
+#         return 0
+#     return int(fuzzy_match(a, b, t["ratio"], t["max_edits"]))
+
+INVALID_VALUES = {
+    "", "null", "none", "nan",
+    "not available", "error",
+    "na", "n/a", "not found"
+}
+
+def is_invalid(v):
+    if v is None:
+        return True
+    return str(v).strip().lower() in INVALID_VALUES
+
+
+def check_dealer_name(a, b, t=THRESHOLDS["dealer_name"]):
+    """
+    a = dealer_name (expected / p_base_data)
+    b = dealer_name_unst_str (observed / invoice OCR)
+
+    Returns:
+        "yes" = matching (or observed value is 'not available' -> treat as match)
+        "no"  = not matching
+    """
+
+    # If OBSERVED (invoice) value is invalid / not available -> treat as MATCH
+    if is_invalid(b):
+        return "yes"
+
+    # If EXPECTED value is invalid -> cannot match
+    if is_invalid(a):
+        return "no"
+
+    a_norm, b_norm = norm_dealer_name(a), norm_dealer_name(b)
+
+    if not a_norm or not b_norm:
+        # If observed became empty after normalization, treat as match
+        if not b_norm:
+            return "yes"
+        return "no"
+
+    score = fuzz.token_set_ratio(a_norm, b_norm)  # 0-100
+
+    if score >= t["ratio"] * 100:
+        return "yes"
+
+    if edit_distance(a_norm, b_norm) <= t["max_edits"]:
+        return "yes"
+
+    return "no"
+
+
+def check_gstin(a, b, t=THRESHOLDS["gstin"]):
+    """
+    a = dealer_gst (expected / p_base_data)
+    b = dealer_gst_number_unst_str (observed / invoice OCR)
+
+    Returns:
+        "yes" = matching (or observed value is 'not available' -> treat as match)
+        "no"  = not matching
+    """
+
+    # If OBSERVED (invoice) value is invalid / not available -> treat as MATCH
+    if is_invalid(b):
+        return "yes"
+
+    # If EXPECTED value is invalid -> cannot match
+    if is_invalid(a):
+        return "no"
+
+    a_norm, b_norm = norm_alnum_upper(a), norm_alnum_upper(b)
+
+    if not a_norm or not b_norm:
+        if not b_norm:
+            return "yes"
+        return "no"
+
+    if a_norm == b_norm:
+        return "yes"
+
+    if len(a_norm) < 12 or len(b_norm) < 12:
+        return "no"
+
+    if fuzzy_match(a_norm, b_norm, t["ratio"], t["max_edits"]):
+        return "yes"
+
+    return "no"
+
+
+# =========================================================
+# APPLY CHECKS
+# =========================================================
+merged_df["dealer_name_match"] = merged_df.apply(
+    lambda r: check_dealer_name(r.get("dealer_name"), r.get("dealer_name_unst_str")),
+    axis=1
+)
+
+merged_df["dealer_gst_match"] = merged_df.apply(
+    lambda r: check_gstin(r.get("dealer_gst"), r.get("dealer_gst_number_unst_str")),
+    axis=1
+)
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+def build_exception_flag(name_match, gst_match):
+    # Exception = "yes" if EITHER name or GST does NOT match
+    if name_match == "no" or gst_match == "no":
+        return "yes"
+    return "no"
+
+
+def build_observed_value(name_match, gst_match):
+    name_txt = (
+        "dealer name is matching"
+        if name_match == "yes"
+        else "dealer name is not matching"
+    )
+
+    gst_txt = (
+        "GST number is matching"
+        if gst_match == "yes"
+        else "GST number is not matching"
+    )
+
+    return f"{name_txt}; {gst_txt}"
+
+
+def build_additional_remarks(name_match, gst_match):
+    if name_match == "yes" and gst_match == "yes":
+        return "Both dealer name and GST number are matching with customer invoice"
+
+    if name_match == "yes" and gst_match == "no":
+        return "Dealer name is matching but GST number is not matching with customer invoice"
+
+    if name_match == "no" and gst_match == "yes":
+        return "GST number is matching but dealer name is not matching with customer invoice"
+
+    return "Both dealer name and GST number are not matching with customer invoice"
+
+
+output_df = pd.DataFrame({
+    "check_id":                       CHECK_ID,
+    "check_name":                     CHECK_NAME,
+    "created_at":                     now_ts,
+    "updated_at":                     now_ts,
+    "is_active":                      merged_df.get("is_active"),
+    "header_crm_id":                  merged_df["header_crm_id"],
+    "sr_number":                      merged_df.get("sr_number"),
+    "attch_id":                       merged_df["attch_id"],
+    "category":                       merged_df.get("category"),
+    "dealer_name_obeserved_value":    merged_df.get("dealer_name_unst_str"),
+    "dealer_gst_observed_value":      merged_df.get("dealer_gst_number_unst_str"),
+    "dealer_name_expected_value":     merged_df.get("dealer_name"),
+    "dealer_gst_expected_value":      merged_df.get("dealer_gst"),
+    "dealer_name_match":              merged_df["dealer_name_match"],
+    "dealer_gst_match":               merged_df["dealer_gst_match"],
+    "exception_flag": merged_df.apply(
+        lambda r: build_exception_flag(r["dealer_name_match"], r["dealer_gst_match"]),
+        axis=1
+    ),
+    "reason": merged_df.apply(
+        lambda r: build_observed_value(r["dealer_name_match"], r["dealer_gst_match"]),
+        axis=1
+    ),
+    "additional_remarks": merged_df.apply(
+        lambda r: build_additional_remarks(r["dealer_name_match"], r["dealer_gst_match"]),
+        axis=1
+    ),
+})
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+
+test = output_df[output_df['exception_flag'] == 'yes']
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+print(f"Name match=yes:  {(output_df['dealer_name_match']=='yes').sum()}")
+print(f"Name match=no:   {(output_df['dealer_name_match']=='no').sum()}")
+print(f"GST match=yes:   {(output_df['dealer_gst_match']=='yes').sum()}")
+print(f"GST match=no:    {(output_df['dealer_gst_match']=='no').sum()}")
+print(f"Exception=no (both match):            {(output_df['exception_flag']=='no').sum()}")
+print(f"Exception=yes (one or both mismatch): {(output_df['exception_flag']=='yes').sum()}")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id VARCHAR(255),
+#   category VARCHAR(255),
+#   dealer_name_unst_str TEXT,
+#   dealer_gst_number_unst_str TEXT,
+#   dealer_name TEXT,
+#   dealer_gst TEXT,
+#   dealer_name_match TINYINT,
+#   dealer_gst_match TINYINT,
+#   exception_flag VARCHAR(10),
+#   observed_value TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id)
+# )
+# """
+
+# cursor.execute(create_sql)
+# conn.commit()
+
+
+insert_cols = [
+    "check_id","check_name","created_at","updated_at","is_active",
+    "header_crm_id","sr_number","attch_id","category",
+    "dealer_name_obeserved_value",
+    "dealer_gst_observed_value",
+    "dealer_name_expected_value",
+    "dealer_gst_expected_value",
+    "dealer_name_match","dealer_gst_match",
+    "exception_flag","reason","additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols if c not in ["check_id","header_crm_id","sr_number","attch_id","created_at"]]
+update_sql = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i+BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i+len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1002")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################################################################
+
+
+
+
+
+
+
+#!/usr/bin/env python
+# coding: utf-8
+
 # In[2]:
 
 
