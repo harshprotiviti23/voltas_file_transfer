@@ -1,3 +1,512 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[8]:
+
+
+
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from collections import defaultdict
+from rapidfuzz import fuzz
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1017
+CHECK_NAME  = "Change in ownership"
+NEW_TABLE   = "p_table_1017"
+
+# Similarity threshold for ADDRESS comparison
+# If address similarity < 70% AND no phone overlap -> exception (ownership change)
+ADDRESS_THRESHOLD = 70
+
+# Customer phone columns to combine
+CUSTOMER_PHONE_COLS = [
+    "calling_from_number",
+    "customer_contact",
+    "customer_registered_phone",
+    "customer_alternate_phone",
+]
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+# sr_df = pd.read_sql("SELECT * FROM p_base_data ",conn)
+
+
+sr_df = pd.read_sql("SELECT * FROM s_crm_claim_hdr_flat WHERE sr_open_date >= '2025-01-16' AND sr_open_date < '2025-01-19'",
+    conn
+)
+print(f"SR rows to process: {len(sr_df)}")
+
+# For grouping by sr_serial_number, pull FULL p_base_data
+all_df = pd.read_sql(
+    "SELECT header_crm_id, sr_id, sr_number, sr_serial_number, "
+    "customer_city, customer_district, customer_state, customer_pincode, "
+    "calling_from_number, customer_contact, "
+    "customer_registered_phone, customer_alternate_phone "
+    "FROM p_base_data "
+    "WHERE sr_serial_number IS NOT NULL AND sr_serial_number != ''",
+    conn
+)
+print(f"All p_base_data rows for grouping: {len(all_df)}")
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "error", "na", "n/a"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+
+def split_multi(v, sep=r"[\^,;/|]"):
+    if is_missing(v):
+        return []
+    return [x.strip() for x in re.split(sep, str(v)) if x.strip()]
+
+
+def clean_phone_set(v):
+    """Return set of cleaned last-10-digit phone numbers."""
+    nums = set()
+    for part in split_multi(v):
+        digits = re.sub(r"\D", "", part)
+        if len(digits) >= 10:
+            nums.add(digits[-10:])
+    return nums
+
+
+def collect_all_phones(row):
+    """Union of all phones across the 4 customer phone columns."""
+    phones = set()
+    for col in CUSTOMER_PHONE_COLS:
+        phones |= clean_phone_set(row.get(col))
+    return phones
+
+
+def clean_serial(v):
+    if is_missing(v):
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(v).upper())
+
+
+def norm_text(v):
+    if is_missing(v):
+        return ""
+    s = str(v).lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def build_address_string(row):
+    """City + District + State + Pincode (normalized)."""
+    city     = norm_text(row.get("customer_city"))
+    district = norm_text(row.get("customer_district"))
+    state    = norm_text(row.get("customer_state"))
+    pincode  = norm_text(row.get("customer_pincode"))
+    return f"{city} | {district} | {state} | {pincode}".strip()
+
+# =========================================================
+# BUILD SERIAL -> [RECORDS] LOOKUP
+# =========================================================
+serial_records = defaultdict(list)
+
+for _, row in all_df.iterrows():
+    serial = clean_serial(row.get("sr_serial_number"))
+    if not serial:
+        continue
+    address = build_address_string(row)
+    phones  = collect_all_phones(row)
+
+    # Skip totally empty profiles
+    if (not address or address.strip(" |") == "") and not phones:
+        continue
+
+    serial_records[serial].append({
+        "address":       address,
+        "phones":        phones,
+        "sr_number":     row.get("sr_number"),
+        "header_crm_id": row.get("header_crm_id"),
+    })
+
+print(f"Distinct serial numbers in lookup: {len(serial_records)}")
+
+# =========================================================
+# CHECK FUNCTION
+# =========================================================
+def check_ownership_change(current_serial, current_sr, current_header,
+                           current_address, current_phones):
+    """
+    Compare current address + phones against OTHER records of the SAME serial
+    that have DIFFERENT sr_number AND DIFFERENT header_crm_id.
+
+    Flag = 1 (ownership change) if for ANY such other record:
+       - Address similarity < ADDRESS_THRESHOLD (70%), AND
+       - There is NO overlap between current phones and other's phones.
+
+    (Phone overlap = same household -> don't flag even if address differs.)
+    """
+    if not current_serial:
+        return 0, 100, "no_phone_match", "", "", "", 0
+
+    records = serial_records.get(current_serial, [])
+
+    # Keep only records with DIFFERENT sr_number AND DIFFERENT header_crm_id
+    others = [
+        r for r in records
+        if (r["sr_number"]     != current_sr)
+        and (r["header_crm_id"] != current_header)
+    ]
+
+    if not others:
+        return 0, 100, "no_others", "", "", "", 0
+
+    # Track conflicting (most-different) match where phones didn't overlap
+    conflicting_score   = 100
+    conflicting_addr    = ""
+    conflicting_sr      = ""
+    conflicting_header  = ""
+    conflicting_phone_status = "no_phone_match"
+    any_flagged   = False
+
+    for r in others:
+        addr_score    = fuzz.token_set_ratio(current_address, r["address"]) if current_address and r["address"] else 0
+        phone_overlap = bool(current_phones & r["phones"]) if current_phones and r["phones"] else False
+
+        # Flag if address is significantly different AND phones don't overlap
+        is_flagged = (addr_score < ADDRESS_THRESHOLD) and (not phone_overlap)
+
+        if is_flagged and addr_score < conflicting_score:
+            conflicting_score   = addr_score
+            conflicting_addr    = r["address"]
+            conflicting_sr      = r["sr_number"]
+            conflicting_header  = r["header_crm_id"]
+            conflicting_phone_status = "phone_overlap" if phone_overlap else "no_phone_match"
+            any_flagged   = True
+
+    flag = 1 if any_flagged else 0
+    return (flag, conflicting_score, conflicting_phone_status,
+            conflicting_addr, conflicting_sr, conflicting_header, len(others))
+
+# =========================================================
+# APPLY CHECK
+# =========================================================
+def row_check(r):
+    serial     = clean_serial(r.get("sr_serial_number"))
+    address    = build_address_string(r)
+    phones     = collect_all_phones(r)
+    cur_sr     = r.get("sr_number")
+    cur_header = r.get("header_crm_id")
+
+    (flag, lowest_score, phone_status,
+     conflicting_addr, conflicting_sr, conflicting_header, total_others) = \
+        check_ownership_change(serial, cur_sr, cur_header, address, phones)
+
+    return pd.Series({
+        "current_address":              address,
+        "current_phones":               ", ".join(sorted(phones)) if phones else "",
+        "lowest_similarity":            lowest_score,
+        "phone_overlap_status":         phone_status,
+        "conflicting_address":          conflicting_addr,
+        "conflicting_sr_number":        conflicting_sr,
+        "conflicting_header_crm_id":    conflicting_header,
+        "total_other_records":          total_others,
+        "ownership_change":             flag,
+    })
+
+check_results = sr_df.apply(row_check, axis=1)
+sr_df["current_address"]           = check_results["current_address"]
+sr_df["current_phones"]            = check_results["current_phones"]
+sr_df["lowest_similarity"]         = check_results["lowest_similarity"].astype(int)
+sr_df["phone_overlap_status"]      = check_results["phone_overlap_status"]
+sr_df["conflicting_address"]       = check_results["conflicting_address"]
+sr_df["conflicting_sr_number"]     = check_results["conflicting_sr_number"]
+sr_df["conflicting_header_crm_id"] = check_results["conflicting_header_crm_id"]
+sr_df["total_other_records"]       = check_results["total_other_records"].astype(int)
+sr_df["ownership_change"]          = check_results["ownership_change"].astype(int)
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+def build_exception_flag(flag):
+    return "yes" if flag == 1 else "no"
+
+
+# def build_expected_value():
+#     return (f"For the same sr_serial_number across different sr_number and "
+#             f"header_crm_id, customer address (City+District+State+Pincode) "
+#             f"should remain consistent (similarity >= {ADDRESS_THRESHOLD}%) "
+#             f"OR at least one phone number should overlap")
+
+def build_expected_value():
+    return ("N/A")
+
+
+def build_observed_value(total_others, flag, lowest_score, conflicting_sr, conflicting_header):
+    if total_others == 0:
+        return "No other SR/header found with the same serial number — single owner record"
+    if flag == 0:
+        return (f"Same serial found in {total_others} other record(s) — "
+                f"either address is consistent or phone numbers overlap "
+                f"(no ownership change detected)")
+    return (f"Same serial found in {total_others} other record(s) — lowest "
+            f"address similarity = {lowest_score}% (against "
+            f"conflicting_sr_number={conflicting_sr}, "
+            f"conflicting_header_crm_id={conflicting_header}) AND no phone "
+            f"number overlap")
+
+
+def build_additional_remarks(flag, lowest_score, conflicting_addr,
+                             conflicting_sr, conflicting_header):
+    if flag == 0:
+        return ("No ownership change detected — address consistent or "
+                "phone numbers overlap across records of the same serial")
+    return (f"Ownership change detected — same sr_serial_number appears in "
+            f"conflicting_sr_number={conflicting_sr}, "
+            f"conflicting_header_crm_id={conflicting_header} with a different "
+            f"address ({lowest_score}% similarity) AND no overlapping phone "
+            f"numbers. Conflicting address: {conflicting_addr}")
+
+
+output_df = pd.DataFrame({
+    "check_id":                    CHECK_ID,
+    "check_name":                  CHECK_NAME,
+    "created_at":                  now_ts,
+    "updated_at":                  now_ts,
+    "is_active":                   sr_df.get("is_active"),
+    "header_crm_id":               sr_df["header_crm_id"],
+    "sr_number":                   sr_df.get("sr_number"),
+    "attch_id":                    sr_df.get("attch_id"),
+    "category":                    sr_df.get("category"),
+    "sr_serial_number":            sr_df.get("sr_serial_number"),
+    "customer_city":               sr_df.get("customer_city"),
+    "customer_district":           sr_df.get("customer_district"),
+    "customer_state":              sr_df.get("customer_state"),
+    "customer_pincode":            sr_df.get("customer_pincode"),
+    "calling_from_number":         sr_df.get("calling_from_number"),
+    "customer_contact":            sr_df.get("customer_contact"),
+    "customer_registered_phone":   sr_df.get("customer_registered_phone"),
+    "customer_alternate_phone":    sr_df.get("customer_alternate_phone"),
+    "current_address":             sr_df["current_address"],
+    "current_phones":              sr_df["current_phones"],
+    "total_other_records":         sr_df["total_other_records"],
+    "lowest_similarity":           sr_df["lowest_similarity"],
+    "phone_overlap_status":        sr_df["phone_overlap_status"],
+    "conflicting_address":         sr_df["conflicting_address"],
+    "conflicting_sr_number":       sr_df["conflicting_sr_number"],
+    "conflicting_header_crm_id":   sr_df["conflicting_header_crm_id"],
+    "exception_flag":              sr_df["ownership_change"].apply(build_exception_flag),
+    "expected_value":              build_expected_value(),
+    "reason": sr_df.apply(
+        lambda r: build_observed_value(
+            r["total_other_records"],
+            r["ownership_change"],
+            r["lowest_similarity"],
+            r["conflicting_sr_number"],
+            r["conflicting_header_crm_id"]
+        ),
+        axis=1
+    ),
+    "additional_remarks": sr_df.apply(
+        lambda r: build_additional_remarks(
+            r["ownership_change"],
+            r["lowest_similarity"],
+            r["conflicting_address"],
+            r["conflicting_sr_number"],
+            r["conflicting_header_crm_id"]
+        ),
+        axis=1
+    ),
+})
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+
+test=output_df[output_df['exception_flag']=='no']
+
+# what should be in observed_value
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+print(f"Exception=yes (ownership change): {(output_df['exception_flag']=='yes').sum()}")
+print(f"Exception=no  (consistent):       {(output_df['exception_flag']=='no').sum()}")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id VARCHAR(255),
+#   category VARCHAR(255),
+#   sr_serial_number VARCHAR(255),
+#   customer_city VARCHAR(255),
+#   customer_district VARCHAR(255),
+#   customer_state VARCHAR(255),
+#   customer_pincode VARCHAR(50),
+#   calling_from_number TEXT,
+#   customer_contact TEXT,
+#   customer_registered_phone TEXT,
+#   customer_alternate_phone TEXT,
+#   current_address TEXT,
+#   current_phones TEXT,
+#   total_other_records INT,
+#   lowest_similarity INT,
+#   phone_overlap_status VARCHAR(50),
+#   conflicting_address TEXT,
+#   conflicting_sr_number VARCHAR(255),
+#   conflicting_header_crm_id VARCHAR(255),
+#   exception_flag VARCHAR(10),
+#   expected_value TEXT,
+#   observed_value TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id)
+# )
+# """
+
+# cursor.execute(create_sql)
+# conn.commit()
+
+# "total_other_records",
+# "lowest_similarity","phone_overlap_status",
+# "conflicting_address","conflicting_sr_number","conflicting_header_crm_id",
+
+
+insert_cols = [
+    "check_id","check_name","created_at","updated_at","is_active",
+    "header_crm_id","sr_number","attch_id","category",
+    "sr_serial_number",
+    "customer_city","customer_district","customer_state","customer_pincode",
+    "calling_from_number","customer_contact",
+    "customer_registered_phone","customer_alternate_phone",
+    "current_address","current_phones",
+    "exception_flag","expected_value","reason","additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols if c not in ["check_id","header_crm_id","sr_number","attch_id", "created_at"]]
+update_sql = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i+BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i+len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1017")
+
+
+# In[ ]:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import os
 import re
 import time
