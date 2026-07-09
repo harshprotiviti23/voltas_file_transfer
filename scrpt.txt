@@ -1,3 +1,915 @@
+
+import os
+import re
+import json
+import base64
+import tempfile
+import time
+from PIL import Image
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+from openai import OpenAI
+import httpx
+import pymysql
+from datetime import datetime
+
+# =========================================================
+# CONFIG
+# =========================================================
+AZURE_OPENAI_KEY = "2J121212323OGcvDD"
+AZURE_BASE_URL = "https:12321321nai/v1/"
+MODEL_NAME = "gpt-4o"
+
+IMAGE_FOLDER = r'\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\inv_jpg'
+OUTPUT_PKL_FOLDER = r'\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\excel_processed_data'
+
+MAX_WORKERS = 8
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 2
+
+# =========================================================
+# BASIC VALIDATIONS
+# =========================================================
+if not AZURE_OPENAI_KEY:
+    raise ValueError("AZURE_OPENAI_KEY environment variable is missing.")
+
+if not IMAGE_FOLDER:
+    raise ValueError("UNSTRUCTURED_IMAGE_FOLDER environment variable is missing.")
+
+if not OUTPUT_PKL_FOLDER:
+    raise ValueError("OUTPUT_PKL_FOLDER environment variable is missing.")
+
+# =========================================================
+# CLIENT
+# =========================================================
+http_client = httpx.Client(trust_env=False)
+
+client = OpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    base_url=AZURE_BASE_URL,
+    http_client=http_client
+)
+
+# =========================================================
+# PROMPTS
+# =========================================================
+INVOICE_PROMPT = """
+You are a highly accurate invoice data extraction system specialized in
+CUSTOMER INVOICES submitted to VOLTAS for WARRANTY CLAIMS.
+
+Extract only the required fields from the invoice image and return STRICT JSON ONLY.
+
+============================================================
+GLOBAL RULES
+============================================================
+1. Output ENGLISH ONLY.
+2. Do NOT hallucinate.
+3. Do NOT guess or infer values.
+4. Extract only values clearly visible in the invoice image.
+5. If any value is not clearly visible, return "Not available".
+6. Return JSON only. No markdown. No explanation. No comments.
+7. Dates must be returned in YYYY-MM-DD format.
+8. If only partial date is visible, return "Not available".
+9. Phone numbers must contain digits only.
+10. Addresses must be single-line comma-separated text.
+11. Remove extra spaces, line breaks, and unnecessary punctuation.
+12. If multiple invoices are present in one image, return:
+    {
+      "invoices": [
+        { same schema },
+        { same schema }
+      ]
+    }
+
+============================================================
+MOST IMPORTANT FIELD: product_serial_number
+============================================================
+Product serial number is VERY CRITICAL.
+
+Definition of a valid product serial number:
+- Alphanumeric only (uppercase letters A-Z and digits 0-9).
+- Length must be greater than 14 characters.
+- Must contain at least one digit.
+- Must NOT contain spaces, slashes, dashes, dots, commas, colons, or any special characters inside.
+- Usually starts with digits and ends with digits.
+- May contain uppercase letters in between.
+
+Where to look (very important):
+- Product serial number is mostly present with the item name or product description.
+- It is often written immediately after the product name, item name, or model description.
+- It may also appear in the line-item table, in the description column,
+  or as a standalone alphanumeric token near the product details.
+- LABEL IS NOT MANDATORY:
+    The serial number may appear WITHOUT any label like "S.No", "Sr No",
+    "Serial No", "S/N", etc. It can simply be printed next to or below the
+    item name as a standalone alphanumeric value.
+- If a label is present, common labels include:
+  Serial No, Sr No, Sr.No, S.No, S No, SR NO, S/N, SN,
+  Product Serial No, Product Sr No, Machine No, Unit Serial No,
+  Barcode, IDU SR NO, ODU SR NO, Indoor Serial No, Outdoor Serial No.
+- Even if no label is present, treat any standalone alphanumeric token
+  matching the format rules (length > 14, alphanumeric, contains digits)
+  near the item/product description as the product serial number.
+
+Multiple serial numbers:
+- A customer may buy multiple products in the same invoice.
+- Therefore, multiple product serial numbers may be present.
+- Extract ALL valid product serial numbers.
+- Join multiple valid product serial numbers using "^" with no spaces.
+
+Strict exclusions — do NOT extract these as product_serial_number:
+- Model number / model code (e.g., short codes printed in the model column)
+- Item code / SKU
+- HSN code / SAC code
+- GSTIN (15-char taxpayer ID)
+- Invoice number / Bill number / Receipt number
+- Customer or dealer mobile/phone number
+- Quantity / Rate / Amount / Discount values
+- Date values
+- PIN code
+
+If no valid product serial number is visible, return "Not available".
+
+============================================================
+FIELD RULES
+============================================================
+
+invoice_number:
+- Extract invoice number / bill number / tax invoice number.
+- Look for labels such as Invoice No, Bill No, Tax Invoice No, Inv No, Receipt No.
+- Keep slashes and dashes if printed.
+- Do not confuse with GSTIN, product serial number, model number, HSN, or phone number.
+
+product_serial_number:
+- Extract as per the rules above.
+- Multiple serials must be separated using "^".
+
+date_of_purchase: 
+- Extract the invoice date / bill date / purchase date from the invoice body or header only. 
+- Convert to YYYY-MM-DD. - Do not use due date, delivery date, warranty date, or print date. 
+- VERY IMPORTANT (IGNORE GPS / CAMERA STAMP DATE): 
+    * Do NOT extract any date printed at the BOTTOM of the image near the longitude / latitude / GPS coordinates. 
+    * Such a date is usually a camera / GPS timestamp overlay and typically appears on a BLACK background (dark box with white text). 
+    * This overlay date is NOT the purchase date and MUST be ignored. 
+- Only pick the genuine invoice/bill/purchase date printed in the invoice content. 
+- If no genuine invoice/bill/purchase date is clearly visible, return "Not available".
+
+dealer_name:
+- Extract seller / dealer / shop / vendor business name.
+- Usually present at the top/header of invoice.
+- Do not extract Voltas brand name unless it is the actual dealer name.
+- Do not extract customer name.
+
+dealer_name: 
+- Extract seller / dealer / shop / vendor business name. 
+- Usually present at the top/header of invoice. 
+- VERY IMPORTANT: Do NOT extract "Voltas" as the dealer name. 
+    * If the dealer/seller name contains the word "Voltas" (in ANY case, e.g. "VOLTAS", "Voltas Ltd", "Voltas Limited"), return "Not available". 
+- Do not extract customer name.
+
+dealer_gst_number:
+- Extract dealer GSTIN only.
+- GSTIN is exactly 15 characters.
+- Pick seller/dealer GSTIN, usually in header.
+- Do not pick customer GSTIN if both are present.
+
+dealer_address:
+- Extract full dealer/seller address from header area.
+- Do not mix with customer address.
+
+customer_name:
+- Extract buyer/customer name.
+- Look near Bill To, Buyer, Customer Name, Sold To, Party Name, Ship To, Consignee.
+- Prefer Bill To / Buyer if both Bill To and Ship To are present.
+- Do not extract dealer name.
+
+customer_address:
+- Extract full customer/buyer address.
+- Look near customer name, Bill To, Buyer, Consignee, or Ship To block.
+- Do not extract dealer address.
+
+customer_phone_number:
+- Extract customer phone/mobile/contact number only.
+- Customer phone number may be multiple.
+- Multiple numbers may be separated by "/", ",", "&", "|", "and", or "or".
+- Extract all customer phone numbers.
+- Digits only.
+- Join multiple phone numbers using "^" with no spaces.
+- Do not extract dealer phone number.
+
+============================================================
+OUTPUT JSON SCHEMA
+============================================================
+{
+  "invoice_number": "string",
+  "product_serial_number": "string",
+  "date_of_purchase": "string",
+  "dealer_name": "string",
+  "dealer_gst_number": "string",
+  "dealer_address": "string",
+  "customer_name": "string",
+  "customer_address": "string",
+  "customer_phone_number": "string"
+}
+
+Return JSON only.
+"""
+
+SERIAL_ONLY_PROMPT = """
+Extract only the product serial number from this Voltas warranty invoice image.
+
+Rules:
+- Product serial number is mostly present with the item name or product description.
+- It is often written immediately after the product name or model description.
+- It may appear WITHOUT any label like "S.No", "Sr No", "Serial No", etc.
+- Even an unlabeled standalone alphanumeric token near the product details
+  should be considered if it matches the format rules below.
+- Product serial number is alphanumeric only.
+- Length must be greater than 14 characters.
+- Must contain at least one digit.
+- No spaces, slashes, dashes, dots, commas, or special characters inside.
+- Extract ALL valid serial numbers.
+- If multiple serial numbers are present, join them using "^" with no spaces.
+- Do not extract HSN code, GSTIN, invoice number, model number, phone number,
+  amount, quantity, rate, or date as a serial number.
+- If no valid serial number is visible, return "Not available".
+
+Return JSON only:
+{
+  "product_serial_number": "string"
+}
+"""
+
+# =========================================================
+# FIELD KEYS
+# =========================================================
+FIELD_KEYS = [
+    "invoice_number",
+    "product_serial_number",
+    "date_of_purchase",
+    "dealer_name",
+    "dealer_gst_number",
+    "dealer_address",
+    "customer_name",
+    "customer_address",
+    "customer_phone_number"
+]
+
+# =========================================================
+# IMAGE HELPERS
+# =========================================================
+def resize_image(image_path, max_size=2048):
+    with Image.open(image_path) as img:
+        if max(img.size) <= max_size:
+            return image_path
+
+        ratio = max_size / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+
+        temp_dir = tempfile.mkdtemp()
+        temp_path = os.path.join(temp_dir, os.path.basename(image_path))
+
+        img.resize(new_size, Image.LANCZOS).save(temp_path)
+        return temp_path
+
+
+def encode_image(image_path):
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        buffer = BytesIO()
+        img.save(buffer, format="JPEG")
+        return base64.b64encode(buffer.getvalue()).decode()
+
+# =========================================================
+# CLEANERS / VALIDATORS
+# =========================================================
+def clean_text(value):
+    if value is None:
+        return "Not available"
+
+    value = str(value).strip()
+
+    if value == "" or value.lower() in ["none", "null", "nan", "not available"]:
+        return "Not available"
+
+    value = re.sub(r"[\r\n\t]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+def is_valid_product_serial(serial):
+    """
+    Valid product serial:
+    - Alphanumeric only (A-Z, 0-9)
+    - Length > 14
+    - Must contain at least one digit
+    """
+    if not serial:
+        return False
+
+    serial = str(serial).strip().upper()
+
+    if len(serial) <= 14:
+        return False
+
+    if not re.match(r"^[A-Z0-9]+$", serial):
+        return False
+
+    if not re.search(r"[0-9]", serial):
+        return False
+
+    return True
+
+
+def clean_product_serial_number(serial_value):
+    """
+    Extract and keep only valid product serial numbers.
+    Multiple valid serial numbers are returned using ^ separator.
+    """
+    if serial_value is None:
+        return "Not available"
+
+    serial_value = str(serial_value).upper().strip()
+
+    if serial_value in ["", "NOT AVAILABLE", "ERROR", "NONE", "NULL", "NAN"]:
+        return "Not available"
+
+    valid_serials = []
+
+    # Split by common separators including ^
+    chunks = re.split(r"[\^,;/|&\s]+", serial_value)
+
+    for chunk in chunks:
+        compact = re.sub(r"[^A-Z0-9]", "", chunk)
+
+        if is_valid_product_serial(compact):
+            if compact not in valid_serials:
+                valid_serials.append(compact)
+
+    # Fallback regex scan over raw text
+    if not valid_serials:
+        candidates = re.findall(r"[A-Z0-9]{15,30}", serial_value)
+        for cand in candidates:
+            if is_valid_product_serial(cand) and cand not in valid_serials:
+                valid_serials.append(cand)
+
+    if valid_serials:
+        return "^".join(valid_serials)
+
+    return "Not available"
+
+
+def clean_customer_phone_number(phone_value):
+    if phone_value is None:
+        return "Not available"
+
+    phone_value = str(phone_value).strip()
+
+    if phone_value == "" or phone_value.lower() in ["not available", "error", "none", "null", "nan"]:
+        return "Not available"
+
+    parts = re.split(r"[\^/,;&|]|\band\b|\bor\b", phone_value, flags=re.IGNORECASE)
+
+    final_numbers = []
+
+    for part in parts:
+        digits = re.sub(r"\D", "", part)
+
+        if not digits:
+            continue
+
+        if len(digits) == 12 and digits.startswith("91"):
+            digits = digits[-10:]
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = digits[-10:]
+
+        if len(digits) == 10 and digits[0] in ["6", "7", "8", "9"]:
+            if digits not in final_numbers:
+                final_numbers.append(digits)
+
+    if final_numbers:
+        return "^".join(final_numbers)
+
+    return "Not available"
+
+
+def clean_gstin(gstin_value):
+    if gstin_value is None:
+        return "Not available"
+
+    gstin_value = str(gstin_value).upper().strip()
+    gstin_value = re.sub(r"[^A-Z0-9]", "", gstin_value)
+
+    pattern = r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$"
+
+    if re.match(pattern, gstin_value):
+        return gstin_value
+
+    return "Not available"
+
+
+def clean_dealer_name(dealer_value):
+    if dealer_value is None:
+        return "Not available"
+
+    dealer_value = str(dealer_value).strip()
+
+    if dealer_value == "" or dealer_value.lower() in ["none", "null", "nan", "not available"]:
+        return "Not available"
+
+    if "voltas" in dealer_value.lower():
+        return "Not available"
+
+    return dealer_value
+
+
+def normalize_extracted_data(data):
+    normalized = {}
+
+    for key in FIELD_KEYS:
+        normalized[key] = clean_text(data.get(key, "Not available"))
+
+    normalized["product_serial_number"] = clean_product_serial_number(
+        normalized.get("product_serial_number", "Not available")
+    )
+
+    normalized["customer_phone_number"] = clean_customer_phone_number(
+        normalized.get("customer_phone_number", "Not available")
+    )
+
+    normalized["dealer_gst_number"] = clean_gstin(
+        normalized.get("dealer_gst_number", "Not available")
+    )
+    normalized["dealer_name"] = clean_dealer_name(
+        normalized.get("dealer_name", "Not available")
+    )
+
+    return normalized
+
+# =========================================================
+# TARGETED SERIAL EXTRACTION
+# =========================================================
+def extract_serial_only(image_b64):
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": SERIAL_ONLY_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+
+        raw = json.loads(response.choices[0].message.content)
+        serial = raw.get("product_serial_number", "Not available")
+
+        return clean_product_serial_number(serial)
+
+    except Exception:
+        return "Not available"
+
+# =========================================================
+# PROCESS IMAGE
+# =========================================================
+def process_image(image_path):
+    backoff = INITIAL_BACKOFF
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            processed_img = resize_image(image_path)
+            image_b64 = encode_image(processed_img)
+
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                temperature=0,
+                max_tokens=3000,
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": INVOICE_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            raw_data = json.loads(response.choices[0].message.content)
+
+            # =====================================================
+            # MULTI-INVOICE SAFE HANDLING
+            # =====================================================
+            if "invoices" in raw_data and isinstance(raw_data["invoices"], list):
+
+                invoices = raw_data["invoices"]
+                merged_data = {k: [] for k in FIELD_KEYS}
+
+                for inv in invoices:
+                    inv = normalize_extracted_data(inv)
+
+                    for key in FIELD_KEYS:
+                        value = inv.get(key, "Not available")
+                        if value and value != "Not available":
+                            merged_data[key].append(str(value))
+
+                data = {}
+
+                for key in FIELD_KEYS:
+                    if merged_data[key]:
+                        if key == "product_serial_number":
+                            data[key] = clean_product_serial_number(
+                                "^".join(merged_data[key])
+                            )
+                        elif key == "customer_phone_number":
+                            data[key] = clean_customer_phone_number(
+                                "^".join(merged_data[key])
+                            )
+                        else:
+                            data[key] = ", ".join(merged_data[key])
+                    else:
+                        data[key] = "Not available"
+
+            else:
+                data = normalize_extracted_data(raw_data)
+
+            # =====================================================
+            # SECOND PASS ONLY IF SERIAL NOT FOUND
+            # =====================================================
+            if data.get("product_serial_number", "Not available") == "Not available":
+                serial_second_pass = extract_serial_only(image_b64)
+                data["product_serial_number"] = serial_second_pass
+
+            data["file_name"] = os.path.basename(image_path)
+
+            print(f"Processed: {data['file_name']}")
+            return data
+
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                print(f"Failed after retries: {os.path.basename(image_path)} | Error: {e}")
+                break
+
+            print(f"Retry {attempt}/{MAX_RETRIES} for {os.path.basename(image_path)}")
+            time.sleep(backoff)
+            backoff *= 2
+
+    err_row = {k: "Error" for k in FIELD_KEYS}
+    err_row["file_name"] = os.path.basename(image_path)
+    return err_row
+
+# =========================================================
+# MAIN EXECUTION - IMAGE EXTRACTION
+# =========================================================
+all_images = [
+    os.path.join(IMAGE_FOLDER, f)
+    for f in os.listdir(IMAGE_FOLDER)
+    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+]
+
+print(f"Total images: {len(all_images)}")
+
+results = []
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [executor.submit(process_image, img) for img in all_images]
+
+    for future in as_completed(futures):
+        results.append(future.result())
+
+df = pd.DataFrame(results)
+
+# =========================================================
+# SAVE PICKLE
+# =========================================================
+os.makedirs(OUTPUT_PKL_FOLDER, exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+pkl_file_name = f"output_voltas_warranty_{timestamp}.pkl"
+full_path = os.path.join(OUTPUT_PKL_FOLDER, pkl_file_name)
+
+df.to_pickle(full_path)
+
+print(f"Pickle File saved at: {full_path}")
+print("Exact Columns:", df.columns.tolist())
+print("IMAGE EXTRACTION COMPLETED SUCCESSFULLY")
+
+# =========================================================
+# DATABASE CONNECTION
+# =========================================================
+# HOST = os.environ.get("DB_HOST")
+# USER = os.environ.get("DB_USER")
+# PASSWORD = os.environ.get("DB_PASSWORD")
+# DATABASE = os.environ.get("DB_DATABASE")
+
+
+HOST='vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER ='fidaCRMAdminUser'
+PASSWORD ='IoC2OuNePtR&]94A'
+DATABASE ='vl-fida-crm-db-preprod'
+
+if not HOST:
+    raise ValueError("DB_HOST environment variable is missing.")
+if not USER:
+    raise ValueError("DB_USER environment variable is missing.")
+if not PASSWORD:
+    raise ValueError("DB_PASSWORD environment variable is missing.")
+if not DATABASE:
+    raise ValueError("DB_DATABASE environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST,
+    user=USER,
+    password=PASSWORD,
+    database=DATABASE,
+    port=3306,
+    ssl=ssl_config
+)
+
+cursor = conn.cursor()
+
+# =========================================================
+# LOAD CLAIM HEADER TABLE
+# =========================================================
+claim_header_table = "s_crm_claim_hdr_flat"
+
+base_query = f"""
+SELECT header_crm_id, sr_id, sr_open_date, sr_closed_date
+FROM {claim_header_table}
+"""
+
+base_data = pd.read_sql(base_query, conn)
+
+print("Base table loaded")
+
+# =========================================================
+# CREATE OUTPUT TABLE
+# =========================================================
+create_table_query = """
+CREATE TABLE IF NOT EXISTS p_unst_str_customer_invoice (
+    header_crm_id VARCHAR(50),
+    sr_id VARCHAR(50),
+    attch_id VARCHAR(50),
+    sr_open_date DATETIME,
+    sr_closed_date DATETIME,
+    file_name VARCHAR(255),
+    invoice_number TEXT,
+    product_serial_number TEXT,
+    date_of_purchase TEXT,
+    dealer_name TEXT,
+    dealer_gst_number VARCHAR(20),
+    dealer_address TEXT,
+    customer_name TEXT,
+    customer_address TEXT,
+    customer_phone_number TEXT
+)
+"""
+
+cursor.execute(create_table_query)
+conn.commit()
+
+print("Output table ready")
+
+# =========================================================
+# EXTRACT IDs FROM FILE NAME
+# =========================================================
+def extract_ids(file_name):
+    try:
+        file_name = str(file_name)
+
+        # Split on ^
+        main_part, rest = file_name.split("^")
+
+        # Extract header_crm_id and sr_id
+        header_crm_id, sr_id = main_part.split("_")
+
+        # Extract attch_id (before next _)
+        attch_id = rest.split("_")[0]
+
+        return header_crm_id, sr_id, attch_id
+
+    except Exception:
+        return None, None, None
+
+
+# Apply to dataframe
+df["header_crm_id"], df["sr_id"], df["attch_id"] = zip(
+    *df["file_name"].apply(extract_ids)
+)
+# =========================================================
+# MERGE WITH BASE TABLE
+# =========================================================
+merged_df = pd.merge(
+    df,
+    base_data,
+    on=["header_crm_id", "sr_id"],
+    how="left"
+)
+
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print("Merge completed")
+
+
+
+# =========================================================
+# CREATE TABLE IF NOT EXISTS
+# =========================================================
+TABLE_NAME = "p_unst_str_customer_invoice"
+WRITE_MODE = "upsert"   # insert | upsert
+
+create_table_query = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+    header_crm_id VARCHAR(50),
+    sr_id VARCHAR(50),
+    attch_id VARCHAR(50),
+
+    sr_open_date DATETIME,
+    sr_closed_date DATETIME,
+
+    file_name TEXT,
+    invoice_number VARCHAR(255),
+    product_serial_number VARCHAR(255),
+    date_of_purchase VARCHAR(255),
+
+    dealer_name TEXT,
+    dealer_gst_number VARCHAR(255),
+    dealer_address TEXT,
+
+    customer_name TEXT,
+    customer_address TEXT,
+    customer_phone_number VARCHAR(255),
+
+    UNIQUE KEY uniq_invoice (
+        header_crm_id,
+        sr_id,
+        attch_id
+    )
+)
+"""
+
+cursor.execute(create_table_query)
+conn.commit()
+
+# =========================================================
+# PREPARE DATA
+# =========================================================
+insert_cols = [
+    "header_crm_id",
+    "sr_id",
+    "attch_id",
+    "sr_open_date",
+    "sr_closed_date",
+    "file_name",
+    "invoice_number",
+    "product_serial_number",
+    "date_of_purchase",
+    "dealer_name",
+    "dealer_gst_number",
+    "dealer_address",
+    "customer_name",
+    "customer_address",
+    "customer_phone_number"
+]
+
+for col in insert_cols:
+    if col not in merged_df.columns:
+        merged_df[col] = None
+
+records = merged_df[insert_cols].values.tolist()
+
+# =========================================================
+# GENERATE INSERT / UPSERT SQL
+# =========================================================
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+if WRITE_MODE.lower() == "upsert":
+
+    update_cols = [
+        c for c in insert_cols
+        if c not in ["header_crm_id", "sr_id", "attch_id"]
+    ]
+
+    update_sql = ", ".join(
+        [f"{c}=VALUES({c})" for c in update_cols]
+    )
+
+    insert_sql = f"""
+    INSERT INTO {TABLE_NAME} ({col_list})
+    VALUES ({placeholders})
+    ON DUPLICATE KEY UPDATE
+    {update_sql}
+    """
+
+else:
+
+    insert_sql = f"""
+    INSERT IGNORE INTO {TABLE_NAME} ({col_list})
+    VALUES ({placeholders})
+    """
+
+# =========================================================
+# BATCH INSERT / UPSERT
+# =========================================================
+BATCH_SIZE = 500
+DB_MAX_RETRIES = 5
+
+for i in range(0, len(records), BATCH_SIZE):
+
+    batch = records[i:i + BATCH_SIZE]
+
+    for attempt in range(DB_MAX_RETRIES):
+
+        try:
+
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+
+            print(
+                f"{WRITE_MODE.upper()} : "
+                f"{i} to {min(i + len(batch), len(records))}"
+            )
+
+            break
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            if "1205" in error_text:
+
+                print(
+                    f"Lock detected. Retry "
+                    f"{attempt + 1}/{DB_MAX_RETRIES}"
+                )
+
+                time.sleep(2)
+
+            else:
+
+                conn.rollback()
+
+                print(
+                    f"Database error in batch "
+                    f"starting at row {i}: {e}"
+                )
+
+                break
+
+# =========================================================
+# CLOSE CONNECTION
+# =========================================================
+cursor.close()
+conn.close()
+
+print(f"{WRITE_MODE.upper()} COMPLETED")
+print("FULL PIPELINE COMPLETED SUCCESSFULLY")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+==========================================================
 #!/usr/bin/env python
 # coding: utf-8
 
