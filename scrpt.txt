@@ -1,4 +1,78 @@
-	dealer_name
+dealer_name: 
+- Extract the ACTUAL seller / dealer / shop / vendor business name. 
+- Usually present at the top/header of invoice. 
+- IMPORTANT (Voltas handling): 
+* "Voltas Limited", "Voltas Ltd", "Voltas" alone is only a BRAND name, NOT a dealer name. If only Voltas branding is present, return "Not available". 
+* "Voltas Authorized Service Partner", "Voltas Authorised Dealer", "Authorized Voltas Dealer" etc. is only a LABEL. The REAL dealer/shop name is usually printed right after / near this label. 
+* In such cases, extract ONLY the real dealer/shop name and DROP the Voltas label text. 
+Example: "Voltas Authorized Service Partner - Sharma Cooling" => dealer_name = "Sharma Cooling" 
+* If no real dealer/shop name exists apart from the Voltas branding/label, return "Not available". 
+- Do not extract customer name.
+
+
+def clean_dealer_name(dealer_value):
+    if dealer_value is None:
+        return "Not available"
+
+    dealer_value = str(dealer_value).strip()
+
+    if dealer_value == "" or dealer_value.lower() in ["none", "null", "nan", "not available"]:
+        return "Not available"
+
+    original = dealer_value
+
+    # Voltas branding / label phrases to strip out
+    voltas_phrases = [
+        r"voltas\s+authoriz(?:e|s)?ed\s+service\s+partner",
+        r"voltas\s+authoris(?:e|s)?ed\s+service\s+partner",
+        r"authoriz(?:e|s)?ed\s+voltas\s+(?:service\s+)?(?:partner|dealer)",
+        r"authoris(?:e|s)?ed\s+voltas\s+(?:service\s+)?(?:partner|dealer)",
+        r"voltas\s+authoriz(?:e|s)?ed\s+dealer",
+        r"voltas\s+authoris(?:e|s)?ed\s+dealer",
+        r"voltas\s+limited",
+        r"voltas\s+ltd\.?",
+        r"voltas",
+    ]
+
+    cleaned = original
+    for phrase in voltas_phrases:
+        cleaned = re.sub(phrase, " ", cleaned, flags=re.IGNORECASE)
+
+    # Remove leftover separators/punctuation at the edges
+    cleaned = re.sub(r"[-–—:|,/]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # If a real dealer name remains, keep it
+    if cleaned and len(cleaned) >= 3:
+        return cleaned
+
+    # Otherwise only Voltas branding was present
+    return "Not available"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------------------------
+dealer_name
 0	Voltas Authorized Service Partner
 1	Voltas Limited
 
