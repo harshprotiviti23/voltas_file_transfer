@@ -1,3 +1,27 @@
+	dealer_name
+0	Voltas Authorized Service Partner
+1	Voltas Limited
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 import os
 import re
