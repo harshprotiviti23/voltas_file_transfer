@@ -1,3 +1,113 @@
+================
+            if "invoices" in raw_data and isinstance(raw_data["invoices"], list):
+                
+                invoices = raw_data["invoices"]
+                merged_data = {k: [] for k in FIELD_KEYS}
+                
+                for inv in invoices:
+                    inv = normalize_extracted_data(inv)
+                    
+                    for key in FIELD_KEYS:
+                        value = inv.get(key, "Not available")
+                        if value and value != "Not available":
+                            merged_data[key].append(str(value))
+                
+                data = {}
+                
+                for key in FIELD_KEYS:
+                    if merged_dataif key == "product_serial_number":
+                            data[key] = clean_product_serial_number(
+                                "^".join(merged_data[key])
+                            )
+                        elif key == "customer_phone_number":
+                            data[key] = clean_customer_phone_number(
+                                "^".join(merged_data[key])
+                            )
+                        else:
+                            data[key] = ", ".join(merged_data[key])
+                    else:
+                        data[key] = "Not available"
+                
+                # Re-apply dealer cleaner to merged value as well
+                data["dealer_name"] = clean_dealer_name(
+                    data.get("dealer_name", "Not available")
+                )
+            
+            else:
+                data = normalize_extracted_data(raw_data)
+            
+            # =====================================================
+            # SECOND PASS ONLY IF SERIAL NOT FOUND
+            # =====================================================
+            if data.get("product_serial_number", "Not available") == "Not available":
+                serial_second_pass = extract_serial_only(image_b64)
+                data["product_serial_number"] = serial_second_pass
+            
+            data["file_name"] = os.path.basename(image_path)
+            
+            print(f"Processed: {data['file_name']}")
+            return data
+        
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                print(f"Failed after retries: {os.path.basename(image_path)} | Error: {e}")
+                break
+            
+            print(f"Retry {attempt}/{MAX_RETRIES} for {os.path.basename(image_path)}")
+            time.sleep(backoff)
+            backoff *= 2
+    
+    err_row = {k: "Error" for k in FIELD_KEYS}
+    err_row["file_name"] = os.path.basename(image_path)
+    return err_row
+
+# =========================================================
+# MAIN EXECUTION - IMAGE EXTRACTION
+# =========================================================
+all_images = [
+    os.path.join(IMAGE_FOLDER, f)
+    for f in os.listdir(IMAGE_FOLDER)
+    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+]
+
+print(f"Total images: {len(all_images)}")
+
+results = []
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = [executor.submit(process_image, img) for img in all_images]
+    
+    for future in as_completed(futures):
+        results.append(future.result())
+
+df = pd.DataFrame(results)
+
+  File <string>:549
+    elif key == "customer_phone_number":
+^                                       
+IndentationError: unindent does not match any outer indentation level
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============================
+
+
+
 import os
 import re
 import json
