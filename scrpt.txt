@@ -1,3 +1,21 @@
+result = (
+    df.groupby(["header_crm_id", "sr_id"], as_index=False)
+      .agg(lambda x: "^".join(pd.unique(x.dropna().astype(str))))
+)
+
+
+
+
+
+
+
+
+
+
+
+==================================
+
+
 dealer_name: 
 - Extract the ACTUAL seller / dealer / shop / vendor business name. 
 - Usually present at the top/header of invoice. 
