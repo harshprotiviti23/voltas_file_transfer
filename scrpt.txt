@@ -1,6 +1,6 @@
-result = (
-    df.groupby(["header_crm_id", "sr_id"], as_index=False)
-      .agg(lambda x: "^".join(pd.unique(x.dropna().astype(str))))
+unst_std = (
+    unst_std.groupby(["header_crm_id", "sr_id"], as_index=False)
+            .agg(lambda x: "^".join(pd.unique(x.dropna().astype(str))))
 )
 
 
