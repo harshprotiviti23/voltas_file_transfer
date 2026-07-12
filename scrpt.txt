@@ -1,3 +1,76 @@
+check_id	check_name	created_at	updated_at	is_active	header_crm_id	sr_number	attch_id	category	dop_observed_value	dop_expected_value	exception_flag	reason	additional_remarks
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECQ2	25011611172	1-1JBF7GTE	Invoice	5/25/2024	4/26/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBF7GTE
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECQ9	25011611689	1-1JBIEU84	Invoice	3/7/2014	3/7/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBIEU84
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECR6	25011603224	1-1JBD0ZI7	Invoice	10/11/2023	1/15/2025	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBD0ZI7
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECT0	25011606428	1-1JBDABXZ	Invoice	1/7/2025	1/1/2025	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBDABXZ
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECTJ	25011609595	1-1JBE0X4O	Bill	4/12/2023	4/10/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBE0X4O
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECTW	25011609745	1-1JBE6YSC	Bill	7/15/2024	7/12/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBE6YSC
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECUA	25011604052	1-1JBD5YB7	Invoice	6/1/2023	4/6/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBD5YB7
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECUI	25011604151	1-1JBGB54X	Invoice	11/2/2022	1/8/2025	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBGB54X
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECVI	25011612086	1-1JBJQGE3	Invoice	1/14/2023	1/14/2025	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBJQGE3
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECVO	25011603473	1-1JFDDZKD	Invoice	11/29/2023	11/24/2023	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JFDDZKD
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECVU	25011603967	1-1JBF593G	Invoice	10/23/2023	10/24/2023	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBF593G
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECWR	25011611026	1-1JBUSP5K	Bill	7/2/2024	7/7/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBUSP5K
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECYC	25011612492	1-1JBKACHV	Invoice	11/23/2024	12/1/2024	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBKACHV
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECYQ	25011611681	1-1JHS7S4W	Bill	Not available~2024-10-29		yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): index_1
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECYQ	25011611681	1-1JHSAO00	Invoice	Not available~2024-10-29		yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): index_1
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ECYQ	25011611681	1-1JHS7S4X	Bill	Not available~2024-10-29		yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): index_1
+1001	DOP matched with Customer Invoice	32:53.0	32:53.0	1	1-1NY0ED0Q	25011600720	1-1JBF08SM	Bill	10/11/2022	11/10/2023	yes	purchase date is not matching with system date	Purchase date mismatch in attachment(s): 1-1JBF08SM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import os
 import re
 import time
