@@ -32,6 +32,484 @@ cursor = conn.cursor()
 # =========================================================
 # META
 # =========================================================
+CHECK_ID    = 1003
+CHECK_NAME  = "Contact details match with Customer Invoice"
+NEW_TABLE   = "p_table_1003"
+
+# =========================================================
+# THRESHOLDS
+# =========================================================
+THRESHOLDS = {
+    "phone": {"ratio": 0.80, "max_edits": 2},
+}
+
+# Base columns to compare against unst phone
+PHONE_BASE_COLS = [
+    "customer_contact",
+    "customer_registered_phone",
+    "customer_alternate_phone",
+    "customer_sr_raise_phone",
+]
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data "
+    "WHERE sr_open_date >= '2025-01-16' "
+    "AND sr_open_date < '2025-01-19' "
+    "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+    conn
+)
+unst_df = pd.read_sql("SELECT * FROM p_unst_str_customer_invoice", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+print(f"unst_str_customer_invoice rows: {len(unst_df)}")
+
+# =========================================================
+# RENAME COLUMNS
+# =========================================================
+JOIN_KEYS = ["header_crm_id", "sr_id", "attch_id"]
+
+unst_df = unst_df.rename(
+    columns={c: f"{c}_unst_str" for c in unst_df.columns if c not in JOIN_KEYS}
+)
+
+# =========================================================
+# MERGE
+# =========================================================
+merged_df = pd.merge(
+    base_df,
+    unst_df.drop_duplicates(subset=JOIN_KEYS),
+    on=JOIN_KEYS, how="left"
+)
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print(f"Merged rows: {len(merged_df)}")
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "error", "na", "n/a"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+
+def split_multi(v, sep=r"[\^,;/|]"):
+    if is_missing(v):
+        return []
+    return [x.strip() for x in re.split(sep, str(v)) if x.strip()]
+
+
+def last10_set(v):
+    """Return set of last-10-digit phone numbers."""
+    nums = set()
+    for part in split_multi(v):
+        digits = re.sub(r"\D", "", part)
+        if len(digits) >= 10:
+            nums.add(digits[-10:])
+    return nums
+
+
+def seq_ratio(a, b):
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def edit_distance(a, b):
+    if not a or not b:
+        return max(len(a or ""), len(b or ""))
+    return Levenshtein.distance(a, b)
+
+
+def fuzzy_match(a, b, ratio_threshold, max_edits):
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if seq_ratio(a, b) >= ratio_threshold:
+        return True
+    if edit_distance(a, b) <= max_edits:
+        return True
+    return False
+
+
+INVALID_VALUES = {
+    "", "null", "none", "nan",
+    "not available", "error",
+    "na", "n/a", "not found",
+    "blank", "unknown", "missing",
+    "not applicable",
+    "-", "--", "n.a", "n.a."
+}
+
+# Substrings that should trigger invalid detection anywhere in the string
+INVALID_SUBSTRINGS = (
+    "not available",
+    "not found",
+    "not applicable",
+    "n/a",
+)
+
+def is_invalid(v):
+    """
+    Returns True if the value is None, NaN, empty, or contains any known
+    NA-like token (case-insensitive, whitespace-tolerant).
+    """
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    s = str(v).strip().lower()
+    if s == "" or s in INVALID_VALUES:
+        return True
+    # Substring safety net (handles "Not Available", "  not available  ", etc.)
+    for token in INVALID_SUBSTRINGS:
+        if token in s:
+            return True
+    return False
+
+
+def find_matching_phone(unst_set, base_set, t):
+    """
+    Return the actual matched phone number (from base_set) if any pair matches.
+    Prefers exact match first, then fuzzy match.
+    """
+    if not unst_set or not base_set:
+        return None
+    # Exact match first
+    common = unst_set & base_set
+    if common:
+        return next(iter(common))
+    # Fuzzy match
+    for x in unst_set:
+        for y in base_set:
+            if fuzzy_match(x, y, t["ratio"], t["max_edits"]):
+                return y
+    return None
+
+
+def check_phone_against_many(unst_val, base_vals, t=THRESHOLDS["phone"]):
+    """
+    Returns:
+        match_flag_str, matched_phone, matched_column
+
+    match_flag_str:
+        "yes" = Matched with at least one base column
+                OR observed value is 'Not available' / invalid (skip check -> yes)
+        "no"  = Not matched
+    """
+    # If OBSERVED (invoice) value is invalid / not available -> treat as MATCH
+    if is_invalid(unst_val):
+        return "yes", "", ""
+
+    unst_set = last10_set(unst_val)
+    if not unst_set:
+        return "yes", "", ""
+
+    found_valid_base = False
+
+    for col_name, val in base_vals.items():
+        if is_invalid(val):
+            continue
+
+        base_set = last10_set(val)
+        if not base_set:
+            continue
+
+        found_valid_base = True
+
+        matched_phone = find_matching_phone(unst_set, base_set, t)
+        if matched_phone:
+            return "yes", matched_phone, col_name
+
+    # If no valid base numbers to compare against, treat as match (skip)
+    if not found_valid_base:
+        return "yes", "", ""
+
+    # Valid numbers were compared but no match found
+    return "no", "", ""
+
+# =========================================================
+# APPLY CHECK
+# =========================================================
+def row_check(r):
+    base_vals = {c: r.get(c) for c in PHONE_BASE_COLS}
+
+    match_flag, matched_phone, matched_col = check_phone_against_many(
+        r.get("customer_phone_number_unst_str"),
+        base_vals
+    )
+
+    return pd.Series({
+        "customer_contact_match": match_flag,           # "yes" or "no"
+        "matched_phone":          matched_phone,         # actual matched number
+        "matched_with_column":    matched_col            # base column name
+    })
+
+
+check_results = merged_df.apply(row_check, axis=1)
+merged_df["customer_contact_match"] = check_results["customer_contact_match"]
+merged_df["matched_phone"]          = check_results["matched_phone"]
+merged_df["matched_with_column"]    = check_results["matched_with_column"]
+
+# =========================================================
+# SAFETY NET — force yes/no correctly when observed is invalid
+# =========================================================
+# This guarantees that regardless of anything above, any row where
+# customer_phone_number_unst_str is invalid/NA becomes match="yes".
+observed_is_invalid_mask = merged_df["customer_phone_number_unst_str"].apply(is_invalid)
+merged_df.loc[observed_is_invalid_mask, "customer_contact_match"] = "yes"
+merged_df.loc[observed_is_invalid_mask, "matched_phone"]          = ""
+merged_df.loc[observed_is_invalid_mask, "matched_with_column"]    = ""
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+def build_exception_flag(match_flag):
+    # match=yes -> exception=no ;  match=no -> exception=yes
+    return "no" if match_flag == "yes" else "yes"
+
+
+def build_reason(match_flag, matched_phone, matched_col):
+    if match_flag == "yes":
+        if matched_phone:
+            return (f"Customer phone number {matched_phone} matched with "
+                    f"'{matched_col}'")
+        return "Customer phone number is matching"
+    return "Customer contact number is not matching with any of the phone numbers"
+
+
+def build_additional_remarks(match_flag, matched_phone, matched_col):
+    if match_flag == "yes":
+        if matched_phone:
+            return (f"Customer phone number from invoice ({matched_phone}) "
+                    f"matched with '{matched_col}' in p_base_data")
+        return "Customer phone number is matching"
+    return ("Customer phone number from invoice did not match with any of: "
+            "customer_contact, customer_registered_phone, "
+            "customer_alternate_phone, customer_sr_raise_phone")
+
+
+output_df = pd.DataFrame({
+    "check_id":                                  CHECK_ID,
+    "check_name":                                CHECK_NAME,
+    "created_at":                                now_ts,
+    "updated_at":                                now_ts,
+    "is_active":                                 merged_df.get("is_active"),
+    "header_crm_id":                             merged_df["header_crm_id"],
+    "sr_number":                                 merged_df.get("sr_number"),
+    "attch_id":                                  merged_df["attch_id"],
+    "category":                                  merged_df.get("category"),
+    "customer_phone_number_observed_value":      merged_df.get("customer_phone_number_unst_str"),
+    "customer_contact_expected_value":           merged_df.get("customer_contact"),
+    "customer_registered_phone_expected_value":  merged_df.get("customer_registered_phone"),
+    "customer_alternate_phone_expected_value":   merged_df.get("customer_alternate_phone"),
+    "customer_sr_raise_phone_expected_value":    merged_df.get("customer_sr_raise_phone"),
+    "customer_contact_match":                    merged_df["customer_contact_match"],
+    "matched_with_column": merged_df.apply(
+        lambda r: (f"{r['matched_phone']} (in {r['matched_with_column']})"
+                   if r["matched_phone"] else ""),
+        axis=1
+    ),
+    "exception_flag": merged_df["customer_contact_match"].apply(build_exception_flag),
+    "reason": merged_df.apply(
+        lambda r: build_reason(
+            r["customer_contact_match"], r["matched_phone"], r["matched_with_column"]
+        ),
+        axis=1
+    ),
+    "additional_remarks": merged_df.apply(
+        lambda r: build_additional_remarks(
+            r["customer_contact_match"], r["matched_phone"], r["matched_with_column"]
+        ),
+        axis=1
+    ),
+})
+
+
+output_df['additional_remarks'] = 'NA'
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+
+test = output_df[output_df['exception_flag'] == 'yes']
+
+# ==== Diagnostic prints (to confirm the fix works) ====
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+print(f"Match=yes (matched):    {(output_df['customer_contact_match']=='yes').sum()}")
+print(f"Match=no  (not matched):{(output_df['customer_contact_match']=='no').sum()}")
+print(f"Exception=yes:          {(output_df['exception_flag']=='yes').sum()}")
+print(f"Exception=no:           {(output_df['exception_flag']=='no').sum()}")
+
+# Verify no "Not available" rows have exception=yes
+na_but_flagged = output_df[
+    output_df['customer_phone_number_observed_value'].apply(is_invalid) &
+    (output_df['exception_flag'] == 'yes')
+]
+print(f"Rows with observed=NA but exception=yes (should be 0): {len(na_but_flagged)}")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id VARCHAR(255),
+#   category VARCHAR(255),
+#   customer_phone_number_unst_str TEXT,
+#   customer_contact TEXT,
+#   customer_registered_phone TEXT,
+#   customer_alternate_phone TEXT,
+#   customer_sr_raise_phone TEXT,
+#   customer_contact_match TINYINT,
+#   matched_with_column VARCHAR(100),
+#   exception_flag VARCHAR(10),
+#   observed_value TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id)
+# )
+# """
+
+# # cursor.execute(create_sql)
+# # conn.commit()
+
+insert_cols = [
+    "check_id","check_name","created_at","updated_at","is_active",
+    "header_crm_id","sr_number","attch_id","category",
+    "customer_phone_number_observed_value",
+    "customer_contact_expected_value",
+    "customer_registered_phone_expected_value",
+    "customer_alternate_phone_expected_value",
+    "customer_sr_raise_phone_expected_value",
+    "customer_contact_match","matched_with_column",
+    "exception_flag","reason","additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols
+               if c not in ["check_id","header_crm_id","sr_number","attch_id","created_at"]]
+update_sql = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i+BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i+len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1003")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+==========================================================================
+
+
+
+
+
+
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
 CHECK_ID    = 1002
 CHECK_NAME  = "Dealer name and GST match with customer invoice"
 NEW_TABLE   = "p_table_1002"
