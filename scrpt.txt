@@ -54,6 +54,930 @@ print(f"unst_str_customer_invoice rows (RAW): {len(unst_df_raw)}")   # should pr
 
 # =========================================================
 # CATEGORY LOOKUP  (attch_id -> category from base_df)
+# =========================================================
+CATEGORY_LOOKUP = {}
+for _, _r in base_df.iterrows():
+    _aid = _r.get("attch_id")
+    _cat = _r.get("category")
+    if _aid is None:
+        continue
+    _aid = str(_aid).strip()
+    if _aid == "" or _aid in CATEGORY_LOOKUP:
+        continue
+    CATEGORY_LOOKUP[_aid] = ("" if _cat is None else str(_cat).strip())
+
+# =========================================================
+# RENAME COLUMNS  (work on a COPY, raw stays intact)
+# =========================================================
+JOIN_KEYS = ["header_crm_id", "sr_id"]
+
+unst_df = unst_df_raw.copy()
+unst_df = unst_df.rename(
+    columns={c: f"{c}_unst_str" for c in unst_df.columns if c not in JOIN_KEYS}
+)
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "not_available",
+             "error", "na", "n/a", "not found", "blank"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+def is_invalid(v):
+    return is_missing(v)
+
+def all_observed_missing(observed_str):
+    """True only if EVERY ~-separated observed value is missing/not-available."""
+    if observed_str is None:
+        return True
+    parts = [x.strip() for x in str(observed_str).split("~")]
+    return all(is_missing(p) for p in parts)
+
+def parse_date_any(v):
+    if is_missing(v):
+        return None
+    s = str(v).strip()
+    fmts = [
+        "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
+        "%d.%m.%Y", "%m-%d-%Y", "%m/%d/%Y",
+        "%d-%b-%Y", "%d %b %Y", "%d-%B-%Y", "%d %B %Y",
+        "%Y-%m-%d %H:%M:%S"
+    ]
+    for f in fmts:
+        try:
+            return datetime.strptime(s[:len(f) + 4], f).date()
+        except:
+            continue
+    try:
+        d = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        return d.date() if pd.notna(d) else None
+    except:
+        return None
+
+# =========================================================
+# POSITIONALLY-ALIGNED AGGREGATION
+# =========================================================
+def join_aligned(series):
+    out = []
+    for v in series.tolist():
+        if v is None:
+            out.append("Not available")
+            continue
+        try:
+            if pd.isna(v):
+                out.append("Not available")
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        out.append(s if s != "" else "Not available")
+    return "~".join(out)
+
+unst_agg = unst_df.groupby(JOIN_KEYS, as_index=False).agg(join_aligned)
+
+print(f"unst aggregated rows (per header_crm_id+sr_id): {len(unst_agg)}")
+
+# =========================================================
+# DEDUP BASE TO ONE ROW PER SR (avoids duplicate output rows)
+# =========================================================
+base_one_per_sr = base_df.drop_duplicates(subset=JOIN_KEYS, keep="first").copy()
+print(f"base_df deduped to one row per SR: {len(base_one_per_sr)}")
+
+# =========================================================
+# MERGE
+# =========================================================
+merged_df = pd.merge(
+    base_one_per_sr,
+    unst_agg.drop_duplicates(subset=JOIN_KEYS),
+    on=JOIN_KEYS, how="left"
+)
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print(f"Merged rows: {len(merged_df)}")
+
+# =========================================================
+# ATTACHMENT-WISE CHECK  (OR LOGIC, aligned attch_id)
+# =========================================================
+def check_date_attachmentwise(expected_date, observed_dates, attch_ids):
+    """
+    Match if ANY observed value matches the expected date.
+
+    Rules:
+      - expected missing (none/null/not available)  -> MATCH (flag 0)   [not present in crm]
+      - all observed missing/not-avail              -> MATCH (flag 0)   [not extracted]
+      - ANY element matches expected                -> MATCH (flag 0), report matching attch_id(s)
+      - valid value(s) present but none match        -> MISMATCH (flag 1)
+
+    Returns: flag, matched_attchs, mismatch_attchs
+    """
+    # Expected missing -> treat as match (not present in crm)
+    if is_missing(expected_date):
+        return 0, "", ""
+
+    expected = parse_date_any(expected_date)
+    if expected is None:
+        return 0, "", ""
+
+    obs_list   = [x.strip() for x in str(observed_dates).split("~")]
+    attch_list = [x.strip() for x in str(attch_ids).split("~")]
+
+    matched_attchs   = []
+    mismatch_attchs  = []
+    valid_value_seen = False
+
+    for idx, obs_date in enumerate(obs_list):
+
+        if idx < len(attch_list):
+            attch = attch_list[idx]
+        elif attch_list:
+            attch = attch_list[-1]
+        else:
+            attch = ""
+
+        if is_missing(obs_date):
+            continue
+
+        valid_value_seen = True
+        obs = parse_date_any(obs_date)
+
+        if obs is not None and obs == expected:
+            matched_attchs.append(attch)
+        else:
+            mismatch_attchs.append(attch)
+
+    matched_attchs  = list(dict.fromkeys([a for a in matched_attchs if a]))
+    mismatch_attchs = list(dict.fromkeys([a for a in mismatch_attchs if a]))
+
+    if not valid_value_seen:
+        return 0, "", ""
+    if matched_attchs:
+        return 0, ",".join(matched_attchs), ""
+    return 1, "", ",".join(mismatch_attchs)
+
+# =========================================================
+# APPLY CHECK  (use ALIGNED unst attch_id)
+# =========================================================
+temp = merged_df.apply(
+    lambda r: check_date_attachmentwise(
+        r.get("purchase_date"),
+        r.get("date_of_purchase_unst_str"),
+        r.get("attch_id_unst_str")
+    ),
+    axis=1
+)
+
+merged_df["date_of_purchase_check"] = temp.apply(lambda x: x[0]).astype(int)
+merged_df["matched_attch_ids"]      = temp.apply(lambda x: x[1])
+merged_df["mismatch_attch_ids"]     = temp.apply(lambda x: x[2])
+
+# Output attch_id = aligned unst attach ids (fallback to base attch_id if unst missing)
+def resolve_attch(r):
+    u = r.get("attch_id_unst_str")
+    if u is not None and str(u).strip() != "" and not is_missing(u):
+        return u
+    return r.get("attch_id")
+
+merged_df["attch_id_out"] = merged_df.apply(resolve_attch, axis=1)
+
+# =========================================================
+# CATEGORY (~ separated)
+# =========================================================
+def build_category(attch_str):
+    if attch_str is None or (isinstance(attch_str, float) and pd.isna(attch_str)):
+        return None
+    ids = [x.strip() for x in str(attch_str).split("~")]
+    cats = []
+    for aid in ids:
+        cat = CATEGORY_LOOKUP.get(aid, "")
+        cats.append(cat if cat != "" else "Not available")
+    return "~".join(cats)
+
+merged_df["category_out"] = merged_df["attch_id_out"].apply(build_category)
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+# reason: priority -> not present in crm > was not extracted > matching/not matching
+def build_reason(row):
+    if is_missing(row.get("purchase_date")):
+        return "purchase date not present in crm"
+    if all_observed_missing(row.get("date_of_purchase_unst_str")):
+        return "purchase date was not extracted"
+    if row["date_of_purchase_check"] == 0:
+        return "purchase date is matching with system date"
+    return "purchase date is not matching with system date"
+
+# additional_remarks: same priority + attachment IDs
+def build_additional_remarks(row):
+    if is_missing(row.get("purchase_date")):
+        return "purchase date not present in crm"
+    if all_observed_missing(row.get("date_of_purchase_unst_str")):
+        return "purchase date was not extracted"
+    if row["date_of_purchase_check"] == 0:
+        if row["matched_attch_ids"]:
+            return f"Purchase date matched with attachment(s): {row['matched_attch_ids']}"
+        return "Purchase date was not extracted in any attachment"
+    return f"Purchase date mismatch in attachment(s): {row['mismatch_attch_ids']}"
+
+# ----- Reformat each ~-separated date value to MM/DD/YYYY -----
+def format_date_mmddyyyy(value_str):
+    if value_str is None:
+        return value_str
+    try:
+        if pd.isna(value_str):
+            return value_str
+    except Exception:
+        pass
+    parts = [x.strip() for x in str(value_str).split("~")]
+    out = []
+    for p in parts:
+        d = parse_date_any(p)
+        if d is not None:
+            out.append(d.strftime("%m/%d/%Y"))   # MM/DD/YYYY
+        else:
+            out.append(p)                          # keep original (e.g. 'Not available')
+    return "~".join(out)
+
+output_df = pd.DataFrame({
+    "check_id":            CHECK_ID,
+    "check_name":          CHECK_NAME,
+    "created_at":          now_ts,
+    "updated_at":          now_ts,
+    "is_active":           merged_df.get("is_active"),
+    "header_crm_id":       merged_df["header_crm_id"],
+    "sr_number":           merged_df.get("sr_number"),
+    "attch_id":            merged_df["attch_id_out"],
+    "category":            merged_df["category_out"],
+    "dop_observed_value":  merged_df.get("date_of_purchase_unst_str"),
+    "dop_expected_value":  merged_df.get("purchase_date"),
+    "exception_flag":      merged_df["date_of_purchase_check"].apply(
+        lambda x: "yes" if x == 1 else "no"
+    ),
+    "reason":              merged_df.apply(build_reason, axis=1),
+})
+
+output_df["additional_remarks"] = merged_df.apply(build_additional_remarks, axis=1)
+
+# ----- Reformat BOTH observed and expected to MM/DD/YYYY (output only, logic untouched) -----
+output_df["dop_observed_value"] = output_df["dop_observed_value"].apply(format_date_mmddyyyy)
+output_df["dop_expected_value"] = output_df["dop_expected_value"].apply(format_date_mmddyyyy)
+
+# =========================================================
+# JOINT DEDUP: attch_id + category stay 1:1 aligned
+# =========================================================
+def dedup_attch_and_category(attch_val, cat_val):
+    if pd.isna(attch_val) or attch_val is None:
+        return attch_val, cat_val
+
+    attch_list = str(attch_val).split("~")
+    cat_list   = str(cat_val).split("~") if (cat_val is not None and not pd.isna(cat_val)) else []
+
+    seen = set()
+    out_attch, out_cat = [], []
+
+    for idx, a in enumerate(attch_list):
+        if a in seen:
+            continue
+        seen.add(a)
+        out_attch.append(a)
+        if idx < len(cat_list):
+            out_cat.append(cat_list[idx])
+
+    return "~".join(out_attch), "~".join(out_cat)
+
+_deduped = output_df.apply(
+    lambda r: dedup_attch_and_category(r["attch_id"], r["category"]),
+    axis=1
+)
+output_df["attch_id"] = _deduped.apply(lambda x: x[0])
+output_df["category"] = _deduped.apply(lambda x: x[1])
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+test = output_df[output_df['exception_flag'] == 'yes']
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+
+# =========================================================
+# SUMMARY COUNT
+# =========================================================
+total_rows   = len(output_df)
+match_count  = (output_df["exception_flag"] == "no").sum()
+mismatch_cnt = (output_df["exception_flag"] == "yes").sum()
+
+print("----------------------------------------")
+print("SUMMARY")
+print(f"Total rows       : {total_rows}")
+print(f"Matches (no)     : {match_count}")
+print(f"Mismatches (yes) : {mismatch_cnt}")
+print("----------------------------------------")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   updated_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id TEXT,
+#   category TEXT,
+#   dop_observed_value TEXT,
+#   dop_expected_value TEXT,
+#   exception_flag VARCHAR(10),
+#   reason TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id(255))
+# )
+# """
+# cursor.execute(create_sql)
+# conn.commit()
+
+insert_cols = [
+    "check_id", "check_name", "created_at", "updated_at", "is_active",
+    "header_crm_id", "sr_number", "attch_id", "category",
+    "dop_observed_value", "dop_expected_value",
+    "exception_flag", "reason", "additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list     = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols
+               if c not in ["check_id", "header_crm_id", "sr_number", "attch_id", "created_at"]]
+update_sql  = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i + BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i + len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1001")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+===================================================
+
+
+
+
+
+
+
+
+
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+import numpy as np
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1001
+CHECK_NAME  = "DOP matched with Customer Invoice"
+NEW_TABLE   = "p_table_1001"
+
+# =========================================================
+# LOAD DATA  (raw dataframes kept UNCHANGED)
+# =========================================================
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data "
+    "WHERE sr_open_date >= '2025-01-16' "
+    "AND sr_open_date < '2025-01-19' "
+    "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+    conn
+)
+unst_df_raw = pd.read_sql("SELECT * FROM p_unst_str_customer_invoice", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+print(f"unst_str_customer_invoice rows (RAW): {len(unst_df_raw)}")   # should print 6802
+
+# =========================================================
+# CATEGORY LOOKUP  (attch_id -> category from base_df)
+# =========================================================
+CATEGORY_LOOKUP = {}
+for _, _r in base_df.iterrows():
+    _aid = _r.get("attch_id")
+    _cat = _r.get("category")
+    if _aid is None:
+        continue
+    _aid = str(_aid).strip()
+    if _aid == "" or _aid in CATEGORY_LOOKUP:
+        continue
+    CATEGORY_LOOKUP[_aid] = ("" if _cat is None else str(_cat).strip())
+
+# =========================================================
+# RENAME COLUMNS  (work on a COPY, raw stays intact)
+# =========================================================
+JOIN_KEYS = ["header_crm_id", "sr_id"]
+
+unst_df = unst_df_raw.copy()
+unst_df = unst_df.rename(
+    columns={c: f"{c}_unst_str" for c in unst_df.columns if c not in JOIN_KEYS}
+)
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "not_available",
+             "error", "na", "n/a", "not found", "blank"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+# expected/observed "missing" checks (same token set)
+def is_invalid(v):
+    return is_missing(v)
+
+def all_observed_missing(observed_str):
+    """True only if EVERY ~-separated observed value is missing/not-available."""
+    if observed_str is None:
+        return True
+    parts = [x.strip() for x in str(observed_str).split("~")]
+    return all(is_missing(p) for p in parts)
+
+def parse_date_any(v):
+    if is_missing(v):
+        return None
+    s = str(v).strip()
+    fmts = [
+        "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
+        "%d.%m.%Y", "%m-%d-%Y", "%m/%d/%Y",
+        "%d-%b-%Y", "%d %b %Y", "%d-%B-%Y", "%d %B %Y",
+        "%Y-%m-%d %H:%M:%S"
+    ]
+    for f in fmts:
+        try:
+            return datetime.strptime(s[:len(f) + 4], f).date()
+        except:
+            continue
+    try:
+        d = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        return d.date() if pd.notna(d) else None
+    except:
+        return None
+
+# =========================================================
+# POSITIONALLY-ALIGNED AGGREGATION
+# =========================================================
+def join_aligned(series):
+    out = []
+    for v in series.tolist():
+        if v is None:
+            out.append("Not available")
+            continue
+        try:
+            if pd.isna(v):
+                out.append("Not available")
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        out.append(s if s != "" else "Not available")
+    return "~".join(out)
+
+unst_agg = unst_df.groupby(JOIN_KEYS, as_index=False).agg(join_aligned)
+
+print(f"unst aggregated rows (per header_crm_id+sr_id): {len(unst_agg)}")
+
+# =========================================================
+# DEDUP BASE TO ONE ROW PER SR (avoids duplicate output rows)
+# =========================================================
+base_one_per_sr = base_df.drop_duplicates(subset=JOIN_KEYS, keep="first").copy()
+print(f"base_df deduped to one row per SR: {len(base_one_per_sr)}")
+
+# =========================================================
+# MERGE
+# =========================================================
+merged_df = pd.merge(
+    base_one_per_sr,
+    unst_agg.drop_duplicates(subset=JOIN_KEYS),
+    on=JOIN_KEYS, how="left"
+)
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print(f"Merged rows: {len(merged_df)}")
+
+# =========================================================
+# ATTACHMENT-WISE CHECK  (OR LOGIC, aligned attch_id)
+# =========================================================
+def check_date_attachmentwise(expected_date, observed_dates, attch_ids):
+    """
+    Match if ANY observed value matches the expected date.
+
+    Rules:
+      - expected missing (none/null/not available)  -> MATCH (flag 0)   [not present in crm]
+      - all observed missing/not-avail              -> MATCH (flag 0)   [not extracted]
+      - ANY element matches expected                -> MATCH (flag 0), report matching attch_id(s)
+      - valid value(s) present but none match        -> MISMATCH (flag 1)
+
+    Returns: flag, matched_attchs, mismatch_attchs
+    """
+    # Expected missing -> treat as match (not present in crm)
+    if is_missing(expected_date):
+        return 0, "", ""
+
+    expected = parse_date_any(expected_date)
+    if expected is None:
+        return 0, "", ""
+
+    obs_list   = [x.strip() for x in str(observed_dates).split("~")]
+    attch_list = [x.strip() for x in str(attch_ids).split("~")]
+
+    matched_attchs   = []
+    mismatch_attchs  = []
+    valid_value_seen = False
+
+    for idx, obs_date in enumerate(obs_list):
+
+        if idx < len(attch_list):
+            attch = attch_list[idx]
+        elif attch_list:
+            attch = attch_list[-1]
+        else:
+            attch = ""
+
+        if is_missing(obs_date):
+            continue
+
+        valid_value_seen = True
+        obs = parse_date_any(obs_date)
+
+        if obs is not None and obs == expected:
+            matched_attchs.append(attch)
+        else:
+            mismatch_attchs.append(attch)
+
+    matched_attchs  = list(dict.fromkeys([a for a in matched_attchs if a]))
+    mismatch_attchs = list(dict.fromkeys([a for a in mismatch_attchs if a]))
+
+    if not valid_value_seen:
+        return 0, "", ""
+    if matched_attchs:
+        return 0, ",".join(matched_attchs), ""
+    return 1, "", ",".join(mismatch_attchs)
+
+# =========================================================
+# APPLY CHECK  (use ALIGNED unst attch_id)
+# =========================================================
+temp = merged_df.apply(
+    lambda r: check_date_attachmentwise(
+        r.get("purchase_date"),
+        r.get("date_of_purchase_unst_str"),
+        r.get("attch_id_unst_str")
+    ),
+    axis=1
+)
+
+merged_df["date_of_purchase_check"] = temp.apply(lambda x: x[0]).astype(int)
+merged_df["matched_attch_ids"]      = temp.apply(lambda x: x[1])
+merged_df["mismatch_attch_ids"]     = temp.apply(lambda x: x[2])
+
+# Output attch_id = aligned unst attach ids (fallback to base attch_id if unst missing)
+def resolve_attch(r):
+    u = r.get("attch_id_unst_str")
+    if u is not None and str(u).strip() != "" and not is_missing(u):
+        return u
+    return r.get("attch_id")
+
+merged_df["attch_id_out"] = merged_df.apply(resolve_attch, axis=1)
+
+# =========================================================
+# CATEGORY (~ separated)
+# =========================================================
+def build_category(attch_str):
+    if attch_str is None or (isinstance(attch_str, float) and pd.isna(attch_str)):
+        return None
+    ids = [x.strip() for x in str(attch_str).split("~")]
+    cats = []
+    for aid in ids:
+        cat = CATEGORY_LOOKUP.get(aid, "")
+        cats.append(cat if cat != "" else "Not available")
+    return "~".join(cats)
+
+merged_df["category_out"] = merged_df["attch_id_out"].apply(build_category)
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+# reason: priority -> not present in crm > was not extracted > matching/not matching
+def build_reason(row):
+    if is_missing(row.get("purchase_date")):
+        return "purchase date not present in crm"
+    if all_observed_missing(row.get("date_of_purchase_unst_str")):
+        return "purchase date was not extracted"
+    if row["date_of_purchase_check"] == 0:
+        return "purchase date is matching with system date"
+    return "purchase date is not matching with system date"
+
+# additional_remarks: same priority + attachment IDs
+def build_additional_remarks(row):
+    if is_missing(row.get("purchase_date")):
+        return "purchase date not present in crm"
+    if all_observed_missing(row.get("date_of_purchase_unst_str")):
+        return "purchase date was not extracted"
+    if row["date_of_purchase_check"] == 0:
+        if row["matched_attch_ids"]:
+            return f"Purchase date matched with attachment(s): {row['matched_attch_ids']}"
+        return "Purchase date was not extracted in any attachment"
+    return f"Purchase date mismatch in attachment(s): {row['mismatch_attch_ids']}"
+
+# ----- Reformat each ~-separated date value to MM/DD/YYYY -----
+def format_date_mmddyyyy(value_str):
+    if value_str is None:
+        return value_str
+    try:
+        if pd.isna(value_str):
+            return value_str
+    except Exception:
+        pass
+    parts = [x.strip() for x in str(value_str).split("~")]
+    out = []
+    for p in parts:
+        d = parse_date_any(p)
+        if d is not None:
+            out.append(d.strftime("%m/%d/%Y"))   # MM/DD/YYYY
+        else:
+            out.append(p)                          # keep original (e.g. 'Not available')
+    return "~".join(out)
+
+output_df = pd.DataFrame({
+    "check_id":            CHECK_ID,
+    "check_name":          CHECK_NAME,
+    "created_at":          now_ts,
+    "updated_at":          now_ts,
+    "is_active":           merged_df.get("is_active"),
+    "header_crm_id":       merged_df["header_crm_id"],
+    "sr_number":           merged_df.get("sr_number"),
+    "attch_id":            merged_df["attch_id_out"],
+    "category":            merged_df["category_out"],
+    "dop_observed_value":  merged_df.get("date_of_purchase_unst_str"),
+    "dop_expected_value":  merged_df.get("purchase_date"),
+    "exception_flag":      merged_df["date_of_purchase_check"].apply(
+        lambda x: "yes" if x == 1 else "no"
+    ),
+    "reason":              merged_df.apply(build_reason, axis=1),
+})
+
+output_df["additional_remarks"] = merged_df.apply(build_additional_remarks, axis=1)
+
+# ----- Reformat BOTH observed and expected to MM/DD/YYYY (output only, logic untouched) -----
+output_df["dop_observed_value"] = output_df["dop_observed_value"].apply(format_date_mmddyyyy)
+output_df["dop_expected_value"] = output_df["dop_expected_value"].apply(format_date_mmddyyyy)
+
+# =========================================================
+# JOINT DEDUP: attch_id + category stay 1:1 aligned
+# =========================================================
+def dedup_attch_and_category(attch_val, cat_val):
+    if pd.isna(attch_val) or attch_val is None:
+        return attch_val, cat_val
+
+    attch_list = str(attch_val).split("~")
+    cat_list   = str(cat_val).split("~") if (cat_val is not None and not pd.isna(cat_val)) else []
+
+    seen = set()
+    out_attch, out_cat = [], []
+
+    for idx, a in enumerate(attch_list):
+        if a in seen:
+            continue
+        seen.add(a)
+        out_attch.append(a)
+        if idx < len(cat_list):
+            out_cat.append(cat_list[idx])
+
+    return "~".join(out_attch), "~".join(out_cat)
+
+_deduped = output_df.apply(
+    lambda r: dedup_attch_and_category(r["attch_id"], r["category"]),
+    axis=1
+)
+output_df["attch_id"] = _deduped.apply(lambda x: x[0])
+output_df["category"] = _deduped.apply(lambda x: x[1])
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+test = output_df[output_df['exception_flag'] == 'yes']
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+
+# =========================================================
+# SUMMARY COUNT
+# =========================================================
+total_rows   = len(output_df)
+match_count  = (output_df["exception_flag"] == "no").sum()
+mismatch_cnt = (output_df["exception_flag"] == "yes").sum()
+
+print("----------------------------------------")
+print("SUMMARY")
+print(f"Total rows       : {total_rows}")
+print(f"Matches (no)     : {match_count}")
+print(f"Mismatches (yes) : {mismatch_cnt}")
+print("----------------------------------------")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   updated_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id TEXT,
+#   category TEXT,
+#   dop_observed_value TEXT,
+#   dop_expected_value TEXT,
+#   exception_flag VARCHAR(10),
+#   reason TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id(255))
+# )
+# """
+# cursor.execute(create_sql)
+# conn.commit()
+
+insert_cols = [
+    "check_id", "check_name", "created_at", "updated_at", "is_active",
+    "header_crm_id", "sr_number", "attch_id", "category",
+    "dop_observed_value", "dop_expected_value",
+    "exception_flag", "reason", "additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list     = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols
+               if c not in ["check_id", "header_crm_id", "sr_number", "attch_id", "created_at"]]
+update
+
+
+
+
+
+
+
+
+
+
+
+===================================================================
+
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+import numpy as np
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1001
+CHECK_NAME  = "DOP matched with Customer Invoice"
+NEW_TABLE   = "p_table_1001"
+
+# =========================================================
+# LOAD DATA  (raw dataframes kept UNCHANGED)
+# =========================================================
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data "
+    "WHERE sr_open_date >= '2025-01-16' "
+    "AND sr_open_date < '2025-01-19' "
+    "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+    conn
+)
+unst_df_raw = pd.read_sql("SELECT * FROM p_unst_str_customer_invoice", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+print(f"unst_str_customer_invoice rows (RAW): {len(unst_df_raw)}")   # should print 6802
+
+# =========================================================
+# CATEGORY LOOKUP  (attch_id -> category from base_df)
 # built BEFORE dedup so every attachment's category is captured
 # =========================================================
 CATEGORY_LOOKUP = {}
