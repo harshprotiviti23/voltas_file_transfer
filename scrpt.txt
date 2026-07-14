@@ -1,3 +1,589 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import re
+import time
+import pymysql
+import pandas as pd
+from datetime import datetime
+from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+
+# =========================================================
+# DB CONFIG
+# =========================================================
+HOST     = 'vl-fida-crm-mysql-flexible-preprod.mysql.database.azure.com'
+USER     = 'fidaCRMAdminUser'
+PASSWORD = 'IoC2OuNePtR&]94A'
+DATABASE = 'vl-fida-crm-db-preprod'
+
+for var_name, var_val in [("DB_HOST", HOST), ("DB_USER", USER),
+                          ("DB_PASSWORD", PASSWORD), ("DB_DATABASE", DATABASE)]:
+    if not var_val:
+        raise ValueError(f"{var_name} environment variable is missing.")
+
+ssl_config = {"ssl_verify_identity": True}
+
+conn = pymysql.connect(
+    host=HOST, user=USER, password=PASSWORD, database=DATABASE,
+    port=3306, ssl=ssl_config
+)
+cursor = conn.cursor()
+
+# =========================================================
+# META
+# =========================================================
+CHECK_ID    = 1004
+CHECK_NAME  = "Name and Serial Number match with Customer Invoice"
+NEW_TABLE   = "p_table_1004"
+
+# =========================================================
+# THRESHOLDS
+# =========================================================
+THRESHOLDS = {
+    "customer_name": {"ratio": 0.70, "max_edits": 5},
+    "serial":        {"ratio": 0.80, "max_edits": 2},
+}
+
+# Base columns to compare against unst serial
+SERIAL_BASE_COLS = [
+    "sr_serial_number",
+    "sr_split_serial_number",
+]
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+base_df = pd.read_sql(
+    "SELECT * FROM p_base_data "
+    "WHERE sr_open_date >= '2025-01-16' "
+    "AND sr_open_date < '2025-01-19' "
+    "AND LOWER(category) IN ('invoice', 'bill', 'customer payment')",
+    conn
+)
+unst_df = pd.read_sql("SELECT * FROM p_unst_str_customer_invoice", conn)
+
+print(f"p_base_data rows: {len(base_df)}")
+print(f"unst_str_customer_invoice rows: {len(unst_df)}")
+
+# =========================================================
+# RENAME COLUMNS
+# =========================================================
+JOIN_KEYS = ["header_crm_id", "sr_id", "attch_id"]
+
+unst_df = unst_df.rename(
+    columns={c: f"{c}_unst_str" for c in unst_df.columns if c not in JOIN_KEYS}
+)
+
+# =========================================================
+# MERGE
+# =========================================================
+merged_df = pd.merge(base_df, unst_df.drop_duplicates(subset=JOIN_KEYS), on=JOIN_KEYS, how="left")
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print(f"Merged rows: {len(merged_df)}")
+
+# =========================================================
+# HELPERS
+# =========================================================
+NA_TOKENS = {"", "none", "null", "nan", "not available", "error", "na", "n/a"}
+
+def is_missing(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    return str(v).strip().lower() in NA_TOKENS
+
+
+def norm_alnum_upper(v):
+    if is_missing(v):
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(v).upper())
+
+
+def norm_text(v):
+    if is_missing(v):
+        return ""
+    s = str(v).lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def split_multi(v, sep=r"[\^,;/|]"):
+    if is_missing(v):
+        return []
+    return [x.strip() for x in re.split(sep, str(v)) if x.strip()]
+
+
+def serial_set(v):
+    """Return set of normalized serial numbers (uppercase alnum)."""
+    out = set()
+    for part in split_multi(v):
+        s = norm_alnum_upper(part)
+        if s:
+            out.add(s)
+    return out
+
+
+def seq_ratio(a, b):
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def edit_distance(a, b):
+    if not a or not b:
+        return max(len(a or ""), len(b or ""))
+    return Levenshtein.distance(a, b)
+
+
+def fuzzy_match(a, b, ratio_threshold, max_edits):
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if seq_ratio(a, b) >= ratio_threshold:
+        return True
+    if edit_distance(a, b) <= max_edits:
+        return True
+    return False
+
+
+def any_pair_matches(set_a, set_b, ratio_threshold, max_edits):
+    if not set_a or not set_b:
+        return False
+    if set_a & set_b:
+        return True
+    for x in set_a:
+        for y in set_b:
+            if fuzzy_match(x, y, ratio_threshold, max_edits):
+                return True
+    return False
+
+
+INVALID_VALUES = {
+    "", "null", "none", "nan",
+    "not available", "error",
+    "na", "n/a", "not found"
+}
+
+def is_invalid(v):
+    if v is None:
+        return True
+    return str(v).strip().lower() in INVALID_VALUES
+
+
+def check_customer_name(a, b, t=THRESHOLDS["customer_name"]):
+    """
+    Customer name check logic:
+        "yes" = matching (or unst value is 'not available' -> treat as matching)
+        "no"  = not matching
+    """
+
+    # If OBSERVED (invoice) value is invalid / not available -> treat as MATCH
+    if is_invalid(b):
+        return "yes"
+
+    if is_invalid(a):
+        return "no"
+
+    a_norm, b_norm = norm_text(a), norm_text(b)
+
+    if not a_norm or not b_norm:
+        if not b_norm:
+            return "yes"
+        return "no"
+
+    if a_norm == b_norm:
+        return "yes"
+
+    score = fuzz.token_set_ratio(a_norm, b_norm)
+    if score >= t["ratio"] * 100:
+        return "yes"
+
+    if edit_distance(a_norm, b_norm) <= t["max_edits"]:
+        return "yes"
+
+    return "no"
+
+
+# def check_serial_against_many(unst_val, base_vals, t=THRESHOLDS["serial"]):
+#     """
+#     Check unst serial(s) against ALL base columns independently.
+#     Returns (matched_flag, matched_columns_str)
+#     matched_columns_str = "sr_serial_number", "sr_split_serial_number",
+#                           "both", or "" if no match.
+#     """
+#     unst_set = serial_set(unst_val)
+#     if not unst_set:
+#         return 0, ""
+
+#     matched_cols = []
+#     for col_name, val in base_vals.items():
+#         base_set = serial_set(val)
+#         if any_pair_matches(unst_set, base_set, t["ratio"], t["max_edits"]):
+#             matched_cols.append(col_name)
+
+#     if not matched_cols:
+#         return 0, ""
+#     if len(matched_cols) == len(SERIAL_BASE_COLS):
+#         return 1, "both"
+#     return 1, matched_cols[0]
+
+
+def check_serial_against_many(unst_val, base_vals, t=THRESHOLDS["serial"]):
+    """
+    Returns:
+        flag, matched_columns_str
+
+    flag:
+        "yes" = Match found with at least one of sr_serial_number
+                or sr_split_serial_number
+                OR unst value is 'not available' (treat as matching)
+        "no"  = Not Match
+
+    matched_columns_str:
+        "sr_serial_number"
+        "sr_split_serial_number"
+        "both"
+        "" (empty)
+    """
+
+    # If OBSERVED value is invalid / not available -> treat as MATCH
+    if is_invalid(unst_val):
+        return "yes", ""
+
+    unst_set = serial_set(unst_val)
+    if not unst_set:
+        return "yes", ""
+
+    matched_cols = []
+    valid_base_found = False
+
+    for col_name, val in base_vals.items():
+        if is_invalid(val):
+            continue
+
+        base_set = serial_set(val)
+        if not base_set:
+            continue
+
+        valid_base_found = True
+
+        if any_pair_matches(
+            unst_set,
+            base_set,
+            t["ratio"],
+            t["max_edits"]
+        ):
+            matched_cols.append(col_name)
+
+    if matched_cols:
+        if len(matched_cols) == len(SERIAL_BASE_COLS):
+            return "yes", "both"
+        return "yes", matched_cols[0]
+
+    if not valid_base_found:
+        return "no", ""
+
+    return "no", ""
+
+
+# =========================================================
+# APPLY CHECKS
+# =========================================================
+def row_check(r):
+    name_flag = check_customer_name(
+        r.get("customer_name"), r.get("customer_name_unst_str")
+    )
+
+    base_vals = {c: r.get(c) for c in SERIAL_BASE_COLS}
+    serial_flag, matched_col = check_serial_against_many(
+        r.get("product_serial_number_unst_str"), base_vals
+    )
+
+    return pd.Series({
+        "customer_name_match":        name_flag,       # "yes" / "no"
+        "product_serial_match":       serial_flag,     # "yes" / "no"
+        "serial_matched_with_column": matched_col if matched_col else ""
+    })
+
+check_results = merged_df.apply(row_check, axis=1)
+merged_df["customer_name_match"]        = check_results["customer_name_match"]
+merged_df["product_serial_match"]       = check_results["product_serial_match"]
+merged_df["serial_matched_with_column"] = check_results["serial_matched_with_column"]
+
+test = merged_df.loc[:, [
+    "customer_name", "customer_name_unst_str", "customer_name_match",
+    "sr_serial_number", "sr_split_serial_number",
+    "product_serial_number_unst_str", "product_serial_match",
+    "serial_matched_with_column"
+]]
+
+
+# =========================================================
+# OUTPUT BUILD
+# =========================================================
+now_ts = datetime.now()
+
+def build_exception_flag(name_match, serial_match):
+    if name_match == "yes" and serial_match == "yes":
+        return "no"
+    return "yes"
+
+
+def build_observed_value(name_match, serial_match, matched_col):
+    name_txt = (
+        "customer name is matching"
+        if name_match == "yes"
+        else "customer name is not matching"
+    )
+
+    if serial_match == "yes":
+        if matched_col == "both":
+            serial_txt = (
+                "product serial number is matching with both "
+                "sr_serial_number and sr_split_serial_number"
+            )
+        elif matched_col:
+            serial_txt = f"product serial number is matching with {matched_col}"
+        else:
+            serial_txt = "product serial number is matching"
+    else:
+        serial_txt = "product serial number is not matching"
+
+    return f"{name_txt}; {serial_txt}"
+
+
+def build_additional_remarks(name_match, serial_match, matched_col):
+
+    if name_match == "yes" and serial_match == "yes":
+        if matched_col == "both":
+            return (
+                "Both customer name and product serial number are matching "
+                "with customer invoice (serial matched with both "
+                "sr_serial_number and sr_split_serial_number)"
+            )
+        if matched_col:
+            return (
+                f"Both customer name and product serial number are matching "
+                f"with customer invoice (serial matched with '{matched_col}')"
+            )
+        return "Both customer name and product serial number are matching with customer invoice"
+
+    if name_match == "no" and serial_match == "yes":
+        if matched_col == "both":
+            return (
+                "Customer name is not matching but product serial number is "
+                "matching with both sr_serial_number and sr_split_serial_number"
+            )
+        if matched_col:
+            return (
+                f"Customer name is not matching but product serial number is "
+                f"matching with '{matched_col}'"
+            )
+        return "Customer name is not matching but product serial number is matching"
+
+    if name_match == "yes" and serial_match == "no":
+        return (
+            "Customer name is matching but product serial number is not "
+            "matching "
+        )
+
+    return (
+        "Both customer name and product serial number are not matching "
+        "with customer invoice"
+    )
+
+
+output_df = pd.DataFrame({
+    "check_id":                       CHECK_ID,
+    "check_name":                     CHECK_NAME,
+    "created_at":                     now_ts,
+    "updated_at":                     now_ts,
+    "is_active":                      merged_df.get("is_active"),
+    "header_crm_id":                  merged_df["header_crm_id"],
+    "sr_number":                      merged_df.get("sr_number"),
+    "attch_id":                       merged_df["attch_id"],
+    "category":                       merged_df.get("category"),
+    "customer_name_observed_value":         merged_df.get("customer_name_unst_str"),
+    "customer_name_expected_value":                  merged_df.get("customer_name"),
+    "product_serial_number_observed_value": merged_df.get("product_serial_number_unst_str"),
+    "sr_serial_number_expected_value":               merged_df.get("sr_serial_number"),
+    "sr_split_serial_number_expected_value":         merged_df.get("sr_split_serial_number"),
+    "customer_name_match":            merged_df["customer_name_match"],
+    "product_serial_match":           merged_df["product_serial_match"],
+    "serial_matched_with_column":     merged_df["serial_matched_with_column"],
+    "exception_flag": merged_df.apply(
+        lambda r: build_exception_flag(r["customer_name_match"], r["product_serial_match"]),
+        axis=1
+    ),
+    "reason": merged_df.apply(
+        lambda r: build_observed_value(
+            r["customer_name_match"],
+            r["product_serial_match"],
+            r["serial_matched_with_column"]
+        ),
+        axis=1
+    ),
+    "additional_remarks": merged_df.apply(
+        lambda r: build_additional_remarks(
+            r["customer_name_match"],
+            r["product_serial_match"],
+            r["serial_matched_with_column"]
+        ),
+        axis=1
+    ),
+})
+
+output_df = output_df.where(pd.notnull(output_df), None)
+
+test=output_df[output_df['exception_flag'] == 'yes']
+
+
+aa=output_df.groupby(['customer_name_match','product_serial_match','exception_flag']).agg({'header_crm_id':'count'}).unstack().reset_index()
+
+print("Flag checks completed.")
+print(f"Total rows: {len(output_df)}")
+print(f"Name match=yes:   {(output_df['customer_name_match']=='yes').sum()}")
+print(f"Name match=no:    {(output_df['customer_name_match']=='no').sum()}")
+print(f"Serial match=yes: {(output_df['product_serial_match']=='yes').sum()}")
+print(f"Serial match=no:  {(output_df['product_serial_match']=='no').sum()}")
+print(f"Exception=no (both match): {(output_df['exception_flag']=='no').sum()}")
+print(f"Exception=yes (one or both mismatch): {(output_df['exception_flag']=='yes').sum()}")
+
+# =========================================================
+# TABLE + INSERT
+# =========================================================
+WRITE_MODE = "upsert"
+
+# create_sql = f"""
+# CREATE TABLE IF NOT EXISTS {NEW_TABLE} (
+#   id BIGINT AUTO_INCREMENT PRIMARY KEY,
+#   check_id INT,
+#   check_name VARCHAR(255),
+#   created_at DATETIME,
+#   is_active TINYINT,
+#   header_crm_id VARCHAR(255),
+#   sr_number VARCHAR(255),
+#   attch_id VARCHAR(255),
+#   category VARCHAR(255),
+#   customer_name_unst_str TEXT,
+#   customer_name TEXT,
+#   product_serial_number_unst_str TEXT,
+#   sr_serial_number TEXT,
+#   sr_split_serial_number TEXT,
+#   customer_name_match TINYINT,
+#   product_serial_match TINYINT,
+#   serial_matched_with_column VARCHAR(100),
+#   exception_flag VARCHAR(10),
+#   observed_value TEXT,
+#   additional_remarks TEXT,
+#   UNIQUE KEY uniq_check_row (check_id, header_crm_id, sr_number, attch_id)
+# )
+# """
+
+# cursor.execute(create_sql)
+# conn.commit()
+
+
+insert_cols = [
+    "check_id","check_name","created_at","updated_at","is_active",
+    "header_crm_id","sr_number","attch_id","category",
+    "customer_name_observed_value",
+    "customer_name_expected_value",
+    "product_serial_number_observed_value",
+    "sr_serial_number_expected_value",
+    "sr_split_serial_number_expected_value",
+    "customer_name_match","product_serial_match","serial_matched_with_column",
+    "exception_flag","reason","additional_remarks"
+]
+
+records = output_df[insert_cols].values.tolist()
+
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+update_cols = [c for c in insert_cols if c not in ["check_id","header_crm_id","sr_number","attch_id","created_at"]]
+update_sql = ", ".join([f"{c}=VALUES({c})" for c in update_cols])
+
+insert_sql = f"""
+INSERT INTO {NEW_TABLE} ({col_list})
+VALUES ({placeholders})
+ON DUPLICATE KEY UPDATE {update_sql}
+"""
+
+# =========================================================
+# BATCH INSERT
+# =========================================================
+BATCH = 500
+
+for i in range(0, len(records), BATCH):
+    batch = records[i:i+BATCH]
+    try:
+        cursor.executemany(insert_sql, batch)
+        conn.commit()
+        print(f"Inserted {i} to {i+len(batch)}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+
+cursor.close()
+conn.close()
+
+print("DONE: Data written to table p_table_1004")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+=============================================================================
+
+
+
+
+
+
+
+
+
+
 import os
 import re
 import time
