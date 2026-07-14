@@ -314,8 +314,9 @@ output_df["reason"] = np.where(
     output_df["reason"]
 )
 
-# ----- Reformat observed value to MM/DD/YYYY (output only, logic untouched) -----
+# ----- Reformat BOTH observed and expected to MM/DD/YYYY (output only, logic untouched) -----
 output_df["dop_observed_value"] = output_df["dop_observed_value"].apply(format_observed_mmddyyyy)
+output_df["dop_expected_value"] = output_df["dop_expected_value"].apply(format_observed_mmddyyyy)
 
 # =========================================================
 # JOINT DEDUP: attch_id + category stay 1:1 aligned
