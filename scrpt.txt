@@ -1,3 +1,47 @@
+def dedup_attch_and_category(attch_val, cat_val):
+    """
+    Dedup attch_id by first occurrence; drop the category element
+    at the SAME position so attch_id and category stay 1:1 aligned.
+    """
+    if pd.isna(attch_val) or attch_val is None:
+        return attch_val, cat_val
+
+    attch_list = str(attch_val).split("~")
+    cat_list   = str(cat_val).split("~") if (cat_val is not None and not pd.isna(cat_val)) else []
+
+    seen = set()
+    out_attch, out_cat = [], []
+
+    for idx, a in enumerate(attch_list):
+        if a in seen:
+            continue                      # duplicate attachment -> skip it AND its category
+        seen.add(a)
+        out_attch.append(a)
+        if idx < len(cat_list):
+            out_cat.append(cat_list[idx])
+
+    return "~".join(out_attch), "~".join(out_cat)
+
+# Apply joint dedup so attch_id and category stay aligned
+_deduped = output_df.apply(
+    lambda r: dedup_attch_and_category(r["attch_id"], r["category"]),
+    axis=1
+)
+output_df["attch_id"] = _deduped.apply(lambda x: x[0])
+output_df["category"] = _deduped.apply(lambda x: x[1])
+
+
+
+
+
+==========================================
+
+
+
+
+
+
+
 import os
 import re
 import time
