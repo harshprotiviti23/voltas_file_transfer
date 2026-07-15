@@ -1,3 +1,31 @@
+
+SOURCE_FOLDER=r'\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\data'
+JPG_FOLDER = r"\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\jpg"
+FINAL_FOLDER = r"\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\inv_jpg"
+POPPLER_PATH=r'\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\Poppler\Release-24.02.0-0\poppler-24.02.0\Library\bin'
+
+
+
+
+
+
+
+
+
+
+=======================================================================
+
+
+
+
+
+
+
+
+
+
+
+
 import sys
 
 
