@@ -1,3 +1,9 @@
+from dotenv import load_dotenv
+
+# ---------- Load .env ----------
+
+load_dotenv()
+
 
 HOST     = os.getenv("DB_HOST")
 USER     = os.getenv("DB_USER")
