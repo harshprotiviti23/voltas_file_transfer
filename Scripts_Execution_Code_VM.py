@@ -1,4 +1,25 @@
 
+HOST     = os.getenv("DB_HOST")
+USER     = os.getenv("DB_USER")
+PASSWORD = os.getenv("DB_PASSWORD")
+DATABASE = os.getenv("DB_DATABASE")
+
+if not all([HOST, USER, PASSWORD, DATABASE]):
+    raise ValueError("One or more DB environment variables are missing. Check your .env file.")
+
+
+
+
+
+
+=====================================================
+
+
+
+
+
+
+
 SOURCE_FOLDER=r'\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\data'
 JPG_FOLDER = r"\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\jpg"
 FINAL_FOLDER = r"\\vlfidacrmfilepreprod.file.core.windows.net\vlfidacrmfilesharepreprod\inv_jpg"
