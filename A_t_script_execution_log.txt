@@ -1,0 +1,13 @@
+
+CREATE TABLE `t_script_execution_log` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `check_id` int DEFAULT NULL,
+  `script_name` varchar(255) DEFAULT NULL,
+  `script_type` varchar(50) DEFAULT NULL,
+  `status` varchar(50) DEFAULT NULL,
+  `error_message` text,
+  `start_time` datetime DEFAULT NULL,
+  `end_time` datetime DEFAULT NULL,
+  `no_of_claims` varchar(10) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=5093 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
