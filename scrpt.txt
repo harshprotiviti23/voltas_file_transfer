@@ -14,6 +14,29 @@ claim_ids = [int(x) for x in args.ids.split(",")]
 
 
 
+=========================================
+
+
+
+
+
+
+import argparse
+import pandas as pd
+ 
+parser = argparse.ArgumentParser()
+parser.add_argument("--ids", required=True)
+ 
+args = parser.parse_args()
+ 
+claim_ids = [int(x) for x in args.ids.split(",")]
+
+
+
+
+
+
+
 
 
 
