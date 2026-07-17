@@ -1,3 +1,264 @@
+
+# =========================================================
+# CREATE OUTPUT TABLE
+# =========================================================
+create_table_query = """
+CREATE TABLE IF NOT EXISTS p_unst_str_customer_invoice (
+    header_crm_id VARCHAR(50),
+    sr_id VARCHAR(50),
+    attch_id VARCHAR(50),
+    sr_open_date DATETIME,
+    sr_closed_date DATETIME,
+    file_name VARCHAR(255),
+    invoice_number TEXT,
+    product_serial_number TEXT,
+    date_of_purchase TEXT,
+    dealer_name TEXT,
+    dealer_gst_number VARCHAR(100),
+    dealer_address TEXT,
+    customer_name TEXT,
+    customer_address TEXT,
+    customer_phone_number TEXT
+)
+"""
+
+cursor.execute(create_table_query)
+conn.commit()
+
+print("Output table ready")
+
+# =========================================================
+# EXTRACT IDs FROM FILE NAME
+# =========================================================
+def extract_ids(file_name):
+    try:
+        file_name = str(file_name)
+
+        # Split on ^
+        main_part, rest = file_name.split("^")
+
+        # Extract header_crm_id and sr_id
+        header_crm_id, sr_id = main_part.split("_")
+
+        # Extract attch_id (before next _)
+        attch_id = rest.split("_")[0]
+
+        return header_crm_id, sr_id, attch_id
+
+    except Exception:
+        return None, None, None
+
+
+# Apply to dataframe
+df["header_crm_id"], df["sr_id"], df["attch_id"] = zip(
+    *df["file_name"].apply(extract_ids)
+)
+# =========================================================
+# MERGE WITH BASE TABLE
+# =========================================================
+merged_df = pd.merge(
+    df,
+    base_data,
+    on=["header_crm_id", "sr_id"],
+    how="left"
+)
+
+merged_df = merged_df.where(pd.notnull(merged_df), None)
+
+print("Merge completed")
+
+
+# =========================================================
+# CREATE TABLE IF NOT EXISTS
+# =========================================================
+TABLE_NAME = "p_unst_str_customer_invoice"
+WRITE_MODE = "upsert"   # insert | upsert
+
+# create_table_query = f"""
+# CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+
+#     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+#     header_crm_id VARCHAR(50),
+#     sr_id VARCHAR(50),
+#     attch_id VARCHAR(50),
+
+#     sr_open_date DATETIME,
+#     sr_closed_date DATETIME,
+
+#     file_name VARCHAR(255),
+#     invoice_number TEXT,
+#     product_serial_number TEXT,
+#     date_of_purchase TEXT,
+
+#     dealer_name TEXT,
+#     dealer_gst_number VARCHAR(30),
+#     dealer_address TEXT,
+
+#     customer_name TEXT,
+#     customer_address TEXT,
+#     customer_phone_number TEXT,
+
+#     UNIQUE KEY uniq_invoice (
+#         header_crm_id,
+#         sr_id,
+#         attch_id
+#     )
+# )
+# """
+
+# cursor.execute(create_table_query)
+# conn.commit()
+
+# =========================================================
+# PREPARE DATA
+# =========================================================
+insert_cols = [
+    "header_crm_id",
+    "sr_id",
+    "attch_id",
+    "sr_open_date",
+    "sr_closed_date",
+    "file_name",
+    "invoice_number",
+    "product_serial_number",
+    "date_of_purchase",
+    "dealer_name",
+    "dealer_gst_number",
+    "dealer_address",
+    "customer_name",
+    "customer_address",
+    "customer_phone_number"
+]
+
+for col in insert_cols:
+    if col not in merged_df.columns:
+        merged_df[col] = None
+
+records = merged_df[insert_cols].values.tolist()
+
+# =========================================================
+# GENERATE INSERT / UPSERT SQL
+# =========================================================
+placeholders = ", ".join(["%s"] * len(insert_cols))
+col_list = ", ".join(insert_cols)
+
+if WRITE_MODE.lower() == "upsert":
+
+    update_cols = [
+        c for c in insert_cols
+        if c not in ["header_crm_id", "sr_id", "attch_id"]
+    ]
+
+    update_sql = ", ".join(
+        [f"{c}=VALUES({c})" for c in update_cols]
+    )
+
+    insert_sql = f"""
+    INSERT INTO {TABLE_NAME} ({col_list})
+    VALUES ({placeholders})
+    ON DUPLICATE KEY UPDATE
+    {update_sql}
+    """
+
+else:
+
+    insert_sql = f"""
+    INSERT IGNORE INTO {TABLE_NAME} ({col_list})
+    VALUES ({placeholders})
+    """
+
+# =========================================================
+# BATCH INSERT / UPSERT
+# =========================================================
+BATCH_SIZE = 500
+DB_MAX_RETRIES = 5
+
+for i in range(0, len(records), BATCH_SIZE):
+
+    batch = records[i:i + BATCH_SIZE]
+
+    for attempt in range(DB_MAX_RETRIES):
+
+        try:
+
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+
+            print(
+                f"{WRITE_MODE.upper()} : "
+                f"{i} to {min(i + len(batch), len(records))}"
+            )
+
+            break
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            if "1205" in error_text:
+
+                print(
+                    f"Lock detected. Retry "
+                    f"{attempt + 1}/{DB_MAX_RETRIES}"
+                )
+
+                time.sleep(2)
+
+            else:
+
+                conn.rollback()
+
+                print(
+                    f"Database error in batch "
+                    f"starting at row {i}: {e}"
+                )
+
+                break
+
+# =========================================================
+# CLOSE CONNECTION
+# =========================================================
+cursor.close()
+conn.close()
+
+print(f"{WRITE_MODE.upper()} COMPLETED")
+print("FULL PIPELINE COMPLETED SUCCESSFULLY")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+==================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Total images: 0
  Pickle File saved at: //vlfidacrmfilepreprod.file.core.windows.net/vlfidacrmfilesharepreprod/excel_processed_data\output_voltas_warranty_20260717_035543.pkl
  Exact Columns: []
