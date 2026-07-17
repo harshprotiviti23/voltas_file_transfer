@@ -1,3 +1,42 @@
+Total images: 0
+ Pickle File saved at: //vlfidacrmfilepreprod.file.core.windows.net/vlfidacrmfilesharepreprod/excel_processed_data\output_voltas_warranty_20260717_035543.pkl
+ Exact Columns: []
+ IMAGE EXTRACTION COMPLETED SUCCESSFULLY
+ C:\Users\fidaCRMVMAdminUser\Desktop\Harsh\Final_Scripts\code_unstr_str_customer_invoice.py:724: UserWarning: pandas only supports SQLAlchemy connectable (engine/connection) or database string URI or sqlite3 DBAPI2 connection. Other DBAPI2 objects are not tested. Please consider using SQLAlchemy.
+   base_data = pd.read_sql(base_query, conn)
+ Base table loaded
+ Output table ready
+ Traceback (most recent call last):
+   File "C:\Users\fidaCRMVMAdminUser\Desktop\Harsh\Final_Scripts\code_unstr_str_customer_invoice.py", line 780, in <module>
+     *df["file_name"].apply(extract_ids)
+      ~~^^^^^^^^^^^^^
+   File "C:\ProgramData\anaconda3\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+     indexer = self.columns.get_loc(key)
+   File "C:\ProgramData\anaconda3\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+     raise KeyError(key)
+ KeyError: 'file_name'
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # =========================================================
 # CREATE TABLE IF NOT EXISTS
 # =========================================================
